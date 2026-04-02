@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: baccarat-ai
+    runtime: python
+    plan: starter            # ← "free" cause des spin-down. Passer à "starter" ($7/mois) si le bot s'arrête.
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: TELEGRAM_SESSION
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: PREDICTION_CHANNEL_ID
+        value: "-1003848194038"
+      - key: PREDICTION_CHANNEL_ID2
+        value: "-1003329818758"
+      - key: DISTRIBUTION_CHANNEL_ID
+        value: "0"
+      - key: COMPTEUR2_CHANNEL_ID
+        value: "0"
+      - key: PREDICTION_CHANNEL_ID3
+        value: "0"
+      - key: PREDICTION_CHANNEL_ID4
+        value: "0"
+      - key: PORT
+        value: 10000
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: 3.12.0
+
+    autoDeploy: true

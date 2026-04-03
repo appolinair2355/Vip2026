@@ -89,6 +89,9 @@ recently_predicted: Set[int] = set()  # Anti-doublon : game_numbers déjà envoy
 pending_strategy_proposal: Dict = {}   # {name, changes, description, expires}
 auto_strategy_revert:    Dict = {}   # anciens paramètres avant auto-application (pour Annuler)
 
+# Proposition horaire auto en attente de confirmation admin
+hourly_pending_auto: Optional[Dict] = None   # {best_auto, msg_id, heure, timestamp}
+
 # Dernier résultat de simulation silencieuse (cmd_strategie → /raison2)
 last_strategy_simulation: Dict = {}    # stocke les combos + scores + recommandation
 
@@ -1486,10 +1489,11 @@ def _rolling_score(state: dict, window: int = ROLLING_WINDOW):
 async def auto_strategy_hourly_loop():
     """
     Toutes les heures pile (01:00, 02:00, … 24:00) :
-    - Lit silent_combo_states (216 trackers)
-    - Score GLISSANT sur les 30 dernières prédictions (pas cumulatif)
-    - Trouve la meilleure combinaison parmi les éligibles (min 3 pred)
-    - Appelle apply_best_strategy_auto() + envoie classement P1/P2/P3 à l'admin
+    1. Évalue les 216 trackers sur la fenêtre de l'heure écoulée
+    2. Envoie la proposition à l'admin avec boutons ✅/❌
+    3. Remet les 216 stocks à zéro immédiatement (nouveau départ)
+    4. Stocke la proposition en DB pour l'historique
+    La stratégie n'est appliquée qu'après confirmation admin.
     """
     while True:
         try:
@@ -1501,36 +1505,76 @@ async def auto_strategy_hourly_loop():
 
             heure = datetime.now().strftime('%H:%M')
 
-            # ── Score glissant pour chaque combo ────────────────────────────
-            best_key   = None
-            best_score = None
-            best_wins  = 0
-            best_val   = None
-
-            # Meilleur par miroir (pour le classement dans la notif)
-            best_per_mirror = {}   # combo_num → (score, wins, losses, recent, key, state)
+            best_key        = None
+            best_score      = None
+            best_wins       = 0
+            best_val        = None
+            best_per_mirror = {}   # pour affichage uniquement (sans filtre perte)
 
             for key, state in silent_combo_states.items():
                 combo_num, wx, b, df_sim = key
                 score, wins, losses, recent = _rolling_score(state)
                 if score is None:
-                    continue   # pas assez de données
+                    continue   # moins de MIN_ROLLING prédictions
 
-                # Meilleur global
-                if best_score is None or score > best_score or (
-                        score == best_score and wins > best_wins):
-                    best_key   = key
-                    best_score = score
-                    best_wins  = wins
-                    best_val   = state
+                # ── Sélection principale : UNIQUEMENT les combos sans aucune perte ──
+                if losses == 0:
+                    # score = wins (puisque losses=0) → on prend le plus de wins
+                    if best_key is None or wins > best_wins or (
+                            wins == best_wins and score > (best_score or 0)):
+                        best_key   = key
+                        best_score = score
+                        best_wins  = wins
+                        best_val   = state
 
-                # Meilleur par miroir
+                # ── Classement par miroir pour la notification (tous combos) ──
                 prev = best_per_mirror.get(combo_num)
                 if prev is None or score > prev[0] or (score == prev[0] and wins > prev[1]):
                     best_per_mirror[combo_num] = (score, wins, losses, recent, key, state)
 
+            # Toujours remettre les stocks à zéro à l'heure pile, même sans données
+            total_preds_before = sum(
+                s.get('total', 0) for s in silent_combo_states.values()
+            )
+            reset_silent_combo_states()
+            logger.info(
+                f"🔄 [{heure}] Stocks silencieux remis à zéro "
+                f"({total_preds_before} prédictions de l'heure écoulée effacées)"
+            )
+
             if best_key is None:
-                logger.info(f"🕐 [{heure}] Auto-stratégie horaire : données insuffisantes (trackers en accumulation)")
+                # Compter combos avec données vs combos avec pertes
+                _with_data   = sum(1 for st in silent_combo_states.values() if st.get('total', 0) >= MIN_ROLLING)
+                _zero_loss   = sum(1 for st in silent_combo_states.values()
+                                   if st.get('total', 0) >= MIN_ROLLING and st.get('losses', 0) == 0)
+                _best_score_fb = max(
+                    (st.get('wins', 0) - st.get('losses', 0)
+                     for st in silent_combo_states.values() if st.get('total', 0) >= MIN_ROLLING),
+                    default=None,
+                )
+                logger.info(
+                    f"🕐 [{heure}] Aucun combo sans perte cette heure "
+                    f"({_with_data} combos avec données, {_zero_loss} sans perte)"
+                )
+                if ADMIN_ID:
+                    try:
+                        msg_no_zero = (
+                            f"🕐 **{heure}** — Évaluation horaire terminée\n\n"
+                            f"📊 Prédictions silencieuses cette heure : **{total_preds_before}**\n"
+                            f"   Combos avec données (≥{MIN_ROLLING} pred.) : **{_with_data}**\n"
+                            f"   Combos sans aucune perte : **{_zero_loss}**\n\n"
+                            + (
+                                f"⚠️ **Aucun combo sans perte cette heure.**\n"
+                                f"Meilleur score trouvé : **{_best_score_fb:+d}** — "
+                                f"non proposé (critère zéro-perte non atteint).\n"
+                                if _with_data > 0 and _zero_loss == 0
+                                else "ℹ️ Données insuffisantes — accumulation en cours.\n"
+                            )
+                            + "_Les stocks repartent à zéro._"
+                        )
+                        await client.send_message(ADMIN_ID, msg_no_zero)
+                    except Exception:
+                        pass
                 continue
 
             combo_num, wx, b, df_sim = best_key
@@ -1553,26 +1597,144 @@ async def auto_strategy_hourly_loop():
                 'wins':         r_wins,
                 'losses':       r_losses,
                 'total':        r_recent,
-                'mirror_ranks': best_per_mirror,   # pour la notif
+                'mirror_ranks': best_per_mirror,
             }
 
             logger.info(
-                f"🕐 [{heure}] Auto-stratégie horaire (rolling {ROLLING_WINDOW}) "
+                f"🕐 [{heure}] Proposition horaire (rolling {ROLLING_WINDOW}) "
                 f"→ {combo['name']} wx={wx} B={b} trigger+{df_sim} | "
                 f"score={r_score:+d} (✅{r_wins} ❌{r_losses} / {r_recent} pred.)"
             )
-            # Log classement des 3 miroirs
-            for cnum in sorted(best_per_mirror):
-                sc, w, l, rc, _, _ = best_per_mirror[cnum]
-                cname = GLOBAL_COMBOS_BY_NUM.get(cnum, {}).get('name', f'P{cnum}')
-                marker = ' ★' if cnum == combo_num else ''
-                logger.info(f"   #{cnum} {cname}{marker} : score={sc:+d} ✅{w} ❌{l} ({rc} pred.)")
 
-            await apply_best_strategy_auto(best_auto)
+            await propose_hourly_strategy(best_auto, heure)
 
         except Exception as e:
             logger.error(f"❌ auto_strategy_hourly_loop: {e}")
             await asyncio.sleep(60)
+
+
+def reset_silent_combo_states():
+    """
+    Remet à zéro les wins/losses/total/pred_history des 216 trackers silencieux.
+    Les compteurs actifs (c13, c13_start, c2, pending) sont conservés.
+    Appelée chaque heure pile après l'évaluation.
+    """
+    for state in silent_combo_states.values():
+        state['wins']         = 0
+        state['losses']       = 0
+        state['total']        = 0
+        state['pred_history'] = []
+
+
+async def _save_strategy_history_entry(entry: dict):
+    """Ajoute une entrée à l'historique strategy_history en DB (max 100 entrées)."""
+    try:
+        history = await db.db_load_kv('strategy_history') or []
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        if len(history) > 100:
+            history = history[-100:]
+        await db.db_save_kv('strategy_history', history)
+    except Exception as e:
+        logger.error(f"❌ _save_strategy_history_entry: {e}")
+
+
+async def propose_hourly_strategy(best_auto: dict, heure: str):
+    """
+    Envoie la proposition de stratégie horaire à l'admin avec boutons ✅/❌.
+    Stocke la proposition en DB (historique).
+    Ne modifie PAS les paramètres actifs — attend la confirmation admin.
+    """
+    global hourly_pending_auto
+    if not ADMIN_ID:
+        return
+
+    mirror_ranks = best_auto.get('mirror_ranks', {})
+    medals  = ['🥇', '🥈', '🥉']
+    sorted_ranks = sorted(
+        mirror_ranks.items(),
+        key=lambda x: (x[1][0], x[1][1]),
+        reverse=True,
+    )
+
+    # Ligne de détail par miroir (avec tous les params)
+    detail_lines = []
+    for rank_idx, (cnum, (sc, w, l, rc, best_k, _)) in enumerate(sorted_ranks):
+        cname  = GLOBAL_COMBOS_BY_NUM.get(cnum, {}).get('name', f'P{cnum}')
+        medal  = medals[rank_idx] if rank_idx < len(medals) else '  '
+        b_num, wx_num, b_b, df_num = best_k
+        detail_lines.append(
+            f"  {medal} **{cname}**\n"
+            f"       P={cnum} | wx={wx_num} | B={b_b} | df+{df_num} | "
+            f"Score **{sc:+d}** (✅{w} ❌{l} / {rc} pred.)"
+        )
+
+    new_df_sim = best_auto.get('df_sim', 1)
+    lines = [
+        "╔══════════════════════════════════╗",
+        f"║  🕐 PROPOSITION HORAIRE — {heure}  ║",
+        "╚══════════════════════════════════╝",
+        "",
+        "📊 **Classement des 3 miroirs (heure écoulée) :**",
+    ] + detail_lines + [
+        "",
+        "🏆 **Meilleure configuration proposée :**",
+        f"  Miroir : **{best_auto['name']}** ({best_auto['disp']})",
+        f"  wx C13 : **{best_auto['wx']}** consécutives",
+        f"  B  C2  : **{best_auto['b']}** absences",
+        f"  df     : **trigger+{new_df_sim}**",
+        f"  Score  : **{best_auto['score']:+d}** pts (✅{best_auto['wins']} ❌{best_auto['losses']} / {best_auto['total']} pred.)",
+        "",
+        "⚠️ _Les stocks silencieux ont été remis à zéro. Nouveau départ._",
+        "",
+        "👇 Confirme pour appliquer cette stratégie maintenant :",
+    ]
+
+    try:
+        msg = await client.send_message(
+            ADMIN_ID,
+            "\n".join(lines),
+            buttons=[
+                [Button.inline("✅ Confirmer", b"confirm_hourly"),
+                 Button.inline("❌ Ignorer",   b"ignore_hourly")],
+            ],
+            parse_mode='markdown',
+        )
+        hourly_pending_auto = {
+            'best_auto':  best_auto,
+            'msg_id':     msg.id,
+            'heure':      heure,
+            'timestamp':  datetime.now().isoformat(),
+        }
+        logger.info(f"📨 Proposition horaire envoyée à l'admin (msg_id={msg.id})")
+    except Exception as e:
+        logger.error(f"❌ propose_hourly_strategy — envoi: {e}")
+        hourly_pending_auto = {
+            'best_auto':  best_auto,
+            'msg_id':     None,
+            'heure':      heure,
+            'timestamp':  datetime.now().isoformat(),
+        }
+
+    entry = {
+        'heure':     heure,
+        'timestamp': datetime.now().isoformat(),
+        'params': {
+            'nom':      best_auto['name'],
+            'miroir':   best_auto['disp'],
+            'combo_num': best_auto['combo_num'],
+            'wx':       best_auto['wx'],
+            'b':        best_auto['b'],
+            'df_sim':   best_auto['df_sim'],
+            'score':    best_auto['score'],
+            'wins':     best_auto['wins'],
+            'losses':   best_auto['losses'],
+            'total':    best_auto['total'],
+        },
+        'decision': 'en_attente',
+    }
+    db.db_schedule(_save_strategy_history_entry(entry))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8823,6 +8985,219 @@ async def cmd_bilan(event):
 
 
 # ============================================================================
+# COMMANDE /historique_strategies — HISTORIQUE DES PROPOSITIONS HORAIRES
+# ============================================================================
+
+async def cmd_historique_strategies(event):
+    """/historique_strategies — affiche les N dernières propositions horaires depuis la DB."""
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+    limit = 10
+    if len(parts) >= 2 and parts[1].isdigit():
+        limit = max(1, min(50, int(parts[1])))
+
+    try:
+        history = await db.db_load_kv('strategy_history') or []
+    except Exception as e:
+        await event.respond(f"❌ Erreur lecture DB : {e}")
+        return
+
+    if not history:
+        await event.respond(
+            "📭 **Aucune proposition horaire en DB.**\n"
+            "_Les propositions sont stockées automatiquement chaque heure._"
+        )
+        return
+
+    entries = history[-limit:]
+    entries.reverse()
+
+    dec_icons = {'confirmée': '✅', 'ignorée': '❌', 'en_attente': '⏳'}
+    lines = [
+        f"╔══════════════════════════════════╗",
+        f"║  📋 HISTORIQUE STRATÉGIES — {limit} dernières  ║",
+        f"╚══════════════════════════════════╝",
+        "",
+    ]
+    for i, e in enumerate(entries, 1):
+        dec     = e.get('decision', '?')
+        icon    = dec_icons.get(dec, '❓')
+        p       = e.get('params', {})
+        ts      = e.get('timestamp', '')[:16].replace('T', ' ')
+        lines.append(
+            f"**{i}. {ts} ({e.get('heure', '?')})** {icon} {dec}\n"
+            f"   {p.get('nom', '?')} | wx={p.get('wx','?')} | B={p.get('b','?')} | df+{p.get('df_sim','?')}\n"
+            f"   Score **{p.get('score', 0):+d}** (✅{p.get('wins',0)} ❌{p.get('losses',0)} / {p.get('total',0)} pred.)"
+        )
+        if i < len(entries):
+            lines.append("─" * 32)
+
+    lines += ["", f"_Total stocké en DB : {len(history)} propositions._"]
+
+    await event.respond("\n".join(lines), parse_mode='markdown')
+
+
+# ============================================================================
+# COMMANDE /formation — BACKTEST FORMATION DE MISE APRÈS PERTE
+# ============================================================================
+
+async def cmd_formation(event):
+    """
+    /formation [N]
+    Teste la formation de mise sur les N dernières prédictions résolues.
+    Formation : quand le bot perd au jeu G, les cartes apparues à G
+    sont testées au jeu G+1 (est-ce que ces suits reviennent ?).
+    Conseille l'administrateur sur la meilleure formation à suivre.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+
+    parts = event.message.message.strip().split()
+    n_pred = 30
+    if len(parts) >= 2 and parts[1].isdigit():
+        n_pred = max(5, min(100, int(parts[1])))
+
+    # ── Récupérer les prédictions résolues (pas en_cours) ──
+    resolved = [
+        p for p in prediction_history
+        if p.get('status', 'en_cours') != 'en_cours'
+    ][:n_pred]
+
+    if not resolved:
+        await event.respond(
+            "📭 **Aucune prédiction résolue en mémoire.**\n"
+            "_L'historique se remplit au fil des prédictions._"
+        )
+        return
+
+    wins_total   = sum(1 for p in resolved if 'gagne' in p.get('status', ''))
+    losses_total = sum(1 for p in resolved if p.get('status') == 'perdu')
+
+    # ── Filtrer les pertes pour tester la formation ──
+    perdues = [p for p in resolved if p.get('status') == 'perdu']
+
+    # Formation stats
+    f1_ok = 0   # 1ère carte de G apparaît à G+1
+    f2_ok = 0   # 2ème carte de G apparaît à G+1
+    f1_total = 0
+    f2_total = 0
+
+    detail_lines = []
+    for pred in perdues[:15]:  # détail des 15 dernières pertes max
+        G          = pred['predicted_game']
+        suit_pred  = pred['suit']
+        suit_disp  = SUIT_DISPLAY.get(suit_pred, suit_pred)
+
+        cache_G    = game_result_cache.get(G, {})
+        cache_G1   = game_result_cache.get(G + 1, {})
+        cards_G    = cache_G.get('player_cards', [])
+        suits_G1   = cache_G1.get('player_suits', set())
+
+        if not cards_G or not suits_G1:
+            detail_lines.append(
+                f"  ❌ Jeu #{G} : prédit {suit_disp} → PERDU | _données cache manquantes_"
+            )
+            continue
+
+        # Cartes apparues au jeu G (ce qui a remplacé le prédit)
+        cards_appeared = [
+            normalize_suit(c.get('S', '')) for c in cards_G
+            if normalize_suit(c.get('S', '')) in ALL_SUITS
+        ]
+        appeared_disp = ' '.join(SUIT_DISPLAY.get(s, s) for s in cards_appeared) or '?'
+
+        # Test formation : les costumes de G apparaissent-ils à G+1 ?
+        f1_suit = cards_appeared[0] if len(cards_appeared) > 0 else None
+        f2_suit = cards_appeared[1] if len(cards_appeared) > 1 else None
+
+        f1_in_G1 = f1_suit in suits_G1 if f1_suit else None
+        f2_in_G1 = f2_suit in suits_G1 if f2_suit else None
+
+        if f1_suit:
+            f1_total += 1
+            if f1_in_G1:
+                f1_ok += 1
+        if f2_suit:
+            f2_total += 1
+            if f2_in_G1:
+                f2_ok += 1
+
+        f1_disp = SUIT_DISPLAY.get(f1_suit, '?') if f1_suit else '—'
+        f2_disp = SUIT_DISPLAY.get(f2_suit, '?') if f2_suit else '—'
+        f1_icon = '✅' if f1_in_G1 else ('❌' if f1_in_G1 is False else '—')
+        f2_icon = '✅' if f2_in_G1 else ('❌' if f2_in_G1 is False else '—')
+
+        detail_lines.append(
+            f"  📍 Jeu #{G} : prédit {suit_disp} → PERDU\n"
+            f"       Apparu au #{G} : {appeared_disp}\n"
+            f"       1ère carte ({f1_disp}) → jeu #{G+1} : {f1_icon}\n"
+            f"       2ème carte ({f2_disp}) → jeu #{G+1} : {f2_icon}"
+        )
+
+    # ── Statistiques globales de la formation ──
+    f1_rate  = round(f1_ok / f1_total * 100) if f1_total > 0 else 0
+    f2_rate  = round(f2_ok / f2_total * 100) if f2_total > 0 else 0
+
+    if f1_rate >= f2_rate and f1_total > 0:
+        best_formation = (
+            f"Après une perte au jeu N, mise sur la **1ère carte apparue au jeu N** "
+            f"pour le jeu N+1.\n"
+            f"  Taux de réussite : **{f1_rate}%** ({f1_ok}/{f1_total})"
+        )
+        best_icon = "🥇"
+    elif f2_total > 0:
+        best_formation = (
+            f"Après une perte au jeu N, mise sur la **2ème carte apparue au jeu N** "
+            f"pour le jeu N+1.\n"
+            f"  Taux de réussite : **{f2_rate}%** ({f2_ok}/{f2_total})"
+        )
+        best_icon = "🥇"
+    else:
+        best_formation = "Données insuffisantes pour déterminer la meilleure formation."
+        best_icon = "⚠️"
+
+    # ── Construire le message final ──
+    lines = [
+        "╔═══════════════════════════════════╗",
+        "║   📊 FORMATION DE MISE — BACKTEST  ║",
+        "╚═══════════════════════════════════╝",
+        "",
+        f"Analyse sur : **{len(resolved)}** prédictions résolues",
+        f"  ✅ Gagnées : **{wins_total}**  |  ❌ Perdues : **{losses_total}**",
+        "",
+        "─── Détail des pertes ───",
+    ] + detail_lines + [
+        "",
+        "─── Résultats de la formation ───",
+        f"  1ère carte du jeu perdu → jeu suivant : "
+        f"**{f1_ok}/{f1_total}** ✅  ({f1_rate}%)" if f1_total > 0 else "  1ère carte : données insuffisantes",
+        f"  2ème carte du jeu perdu → jeu suivant : "
+        f"**{f2_ok}/{f2_total}** ✅  ({f2_rate}%)" if f2_total > 0 else "  2ème carte : données insuffisantes",
+        "",
+        f"─── {best_icon} Recommandation ───",
+        best_formation,
+        "",
+        f"💡 **Comment jouer :**",
+        f"Quand le bot annonce PERDU pour le jeu N :",
+        f"  1. Note le **costume de la 1ère carte** révélée au jeu N",
+        f"  2. Au jeu N+1, mise sur ce costume",
+        f"  3. Si ce costume apparaît dans les cartes du jeu N+1 → gagné",
+        "",
+        f"_Données basées sur {len(perdues)} pertes analysées._",
+    ]
+
+    await event.respond("\n".join(lines), parse_mode='markdown')
+
+
+# ============================================================================
 # COMMANDE /b — GESTION DU B DYNAMIQUE PAR COSTUME
 # ============================================================================
 
@@ -10098,6 +10473,8 @@ async def handle_callback(event):
     global DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID, heures_favorables_active
     global compteur4_trackers, compteur4_current, compteur4_events
     global compteur7_current, compteur8_current
+    global COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
+    global auto_strategy_revert, hourly_pending_auto
 
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.answer("🔒 Admin uniquement", alert=True)
@@ -10147,14 +10524,11 @@ async def handle_callback(event):
 
         # ── Annulation de l'auto-stratégie ────────────────────────────────────
         elif data == 'cancel_auto_strat':
-            global auto_strategy_revert
             if not auto_strategy_revert:
                 await event.answer("Aucune stratégie auto à annuler.", alert=True)
                 return
 
             # Restaurer les paramètres précédents
-            global COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
-            global compteur2_seuil_B, compteur2_seuil_B_per_suit
             COMPTEUR13_MIRROR.clear()
             COMPTEUR13_MIRROR.update(auto_strategy_revert['mirror'])
             COMPTEUR13_THRESHOLD = auto_strategy_revert['wx']
@@ -10179,6 +10553,100 @@ async def handle_callback(event):
                 buttons=None,
             )
             await event.answer("✅ Paramètres précédents restaurés.")
+
+        # ── Confirmation / Ignore proposition horaire auto ─────────────────────
+        elif data == 'confirm_hourly':
+            if not hourly_pending_auto:
+                await event.answer("❌ Aucune proposition en attente.", alert=True)
+                return
+
+            ba = hourly_pending_auto['best_auto']
+            heure_prop = hourly_pending_auto.get('heure', '?')
+
+            # Sauvegarder l'état actuel pour annulation éventuelle
+            auto_strategy_revert = {
+                'mirror':     dict(COMPTEUR13_MIRROR),
+                'wx':         COMPTEUR13_THRESHOLD,
+                'b':          compteur2_seuil_B,
+                'df_sim':     COMPTEUR13_SKIP,
+                'b_per_suit': dict(compteur2_seuil_B_per_suit),
+                'name_prev':  next(
+                    (c['name'] for c in GLOBAL_COMBOS if c['mirror'] == dict(COMPTEUR13_MIRROR)),
+                    'inconnu'
+                ),
+                'msg_id': None,
+            }
+
+            # Appliquer la stratégie
+            new_df_sim = ba.get('df_sim', 1)
+            COMPTEUR13_MIRROR.clear()
+            COMPTEUR13_MIRROR.update(ba['mirror'])
+            COMPTEUR13_THRESHOLD = ba['wx']
+            COMPTEUR13_SKIP      = max(0, new_df_sim - PREDICTION_DF)
+            compteur2_seuil_B    = ba['b']
+            for _s in ALL_SUITS:
+                compteur2_seuil_B_per_suit[_s] = ba['b']
+
+            db.db_schedule(save_runtime_config())
+            logger.info(
+                f"✅ Stratégie horaire confirmée par l'admin : {ba['name']} "
+                f"wx={ba['wx']} B={ba['b']} df+{new_df_sim}"
+            )
+
+            # Mettre à jour la décision dans l'historique DB
+            async def _update_history_confirmed(h: str):
+                try:
+                    history = await db.db_load_kv('strategy_history') or []
+                    for e in reversed(history):
+                        if e.get('heure') == h and e.get('decision') == 'en_attente':
+                            e['decision'] = 'confirmée'
+                            break
+                    await db.db_save_kv('strategy_history', history)
+                except Exception as ex:
+                    logger.error(f"❌ update history confirmed: {ex}")
+            db.db_schedule(_update_history_confirmed(heure_prop))
+
+            hourly_pending_auto = None
+
+            await event.edit(
+                f"✅ **Stratégie confirmée et appliquée !**\n\n"
+                f"  Miroir : **{ba['name']}** ({ba['disp']})\n"
+                f"  wx C13 : **{ba['wx']}** | B C2 : **{ba['b']}** | df+{new_df_sim}\n"
+                f"  Score  : **{ba['score']:+d}** (✅{ba['wins']} ❌{ba['losses']} / {ba['total']})\n\n"
+                f"_Appuie sur Annuler dans la notification précédente pour revenir en arrière si besoin._",
+                buttons=[[Button.inline("❌ Annuler cette stratégie", b"cancel_auto_strat")]],
+            )
+            await event.answer("✅ Stratégie appliquée !")
+
+        elif data == 'ignore_hourly':
+            if not hourly_pending_auto:
+                await event.answer("Aucune proposition en attente.", alert=True)
+                return
+
+            heure_prop = hourly_pending_auto.get('heure', '?')
+            ba_name    = hourly_pending_auto.get('best_auto', {}).get('name', '?')
+
+            async def _update_history_ignored(h: str):
+                try:
+                    history = await db.db_load_kv('strategy_history') or []
+                    for e in reversed(history):
+                        if e.get('heure') == h and e.get('decision') == 'en_attente':
+                            e['decision'] = 'ignorée'
+                            break
+                    await db.db_save_kv('strategy_history', history)
+                except Exception as ex:
+                    logger.error(f"❌ update history ignored: {ex}")
+            db.db_schedule(_update_history_ignored(heure_prop))
+
+            hourly_pending_auto = None
+            logger.info(f"❌ Proposition horaire {heure_prop} ignorée par l'admin.")
+
+            await event.edit(
+                f"❌ **Proposition ignorée** ({heure_prop} — {ba_name})\n"
+                f"_La stratégie actuelle reste inchangée._",
+                buttons=None,
+            )
+            await event.answer("❌ Proposition ignorée.")
 
         # ── Configuration ─────────────────────────────────────────────────────
         elif data == 'df_s':
@@ -10722,7 +11190,9 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur7, events.NewMessage(pattern=r'^/compteur7'))
     client.add_event_handler(cmd_compteur8,  events.NewMessage(pattern=r'^/compteur8'))
     client.add_event_handler(cmd_compteur13, events.NewMessage(pattern=r'^/compteur13'))
-    client.add_event_handler(cmd_strategie,  events.NewMessage(pattern=r'^/strategie$'))
+    client.add_event_handler(cmd_strategie,           events.NewMessage(pattern=r'^/strategie$'))
+    client.add_event_handler(cmd_historique_strategies, events.NewMessage(pattern=r'^/historique_strategies'))
+    client.add_event_handler(cmd_formation,             events.NewMessage(pattern=r'^/formation'))
     client.add_event_handler(cmd_oui,        events.NewMessage(pattern=r'(?i)^oui\s*\d*$'))
     client.add_event_handler(cmd_compteur14, events.NewMessage(pattern=r'^/compteur14'))
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))

@@ -22,8 +22,8 @@ import os
 # Fallbacks intégrés — pas besoin de les définir sur Render
 # ============================================================================
 
-API_ID    = int(os.environ.get("API_ID")    or 30696801)
-API_HASH  = os.environ.get("API_HASH")      or "34c7cd25e847bf6204d09575bcc32e95"
+API_ID    = int(os.environ.get("API_ID")    or 29177661)
+API_HASH  = os.environ.get("API_HASH")      or "a8639172fa8d35dbfd8ea46286d349ab"
 BOT_TOKEN = os.environ.get("BOT_TOKEN")     or "8442253971:AAEisYucgZ49Ej2b-mK9_6DhNrqh9WOc_XU"
 
 # NOTE : TELEGRAM_SESSION est lue directement dans main.py via os.getenv('TELEGRAM_SESSION', '')
@@ -34,7 +34,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")     or "8442253971:AAEisYucgZ49Ej2b-mK9_
 # Fallbacks intégrés — pas besoin de les définir sur Render
 # ============================================================================
 
-ADMIN_ID               = int(os.environ.get("ADMIN_ID")               or 8649780855)
+ADMIN_ID               = int(os.environ.get("ADMIN_ID")               or 1190237801)
 
 # ── Canaux de prédiction (principaux — reçoivent TOUTES les prédictions) ──────
 PREDICTION_CHANNEL_ID  = int(os.environ.get("PREDICTION_CHANNEL_ID")  or -1003848194038)
@@ -58,7 +58,7 @@ PREDICTION_CHANNEL_ID4   = int(_raw_c4)   if _raw_c4   and int(_raw_c4)   != 0 e
 # RENDER_EXTERNAL_URL : URL publique pour le keep-alive
 # ============================================================================
 
-PORT                = int(os.environ.get("PORT") or 10000)
+PORT                = int(os.environ.get("PORT") or 8000)
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://vip-joker-et-kouam-2026-mars-i9hq.onrender.com"
 
 # ============================================================================

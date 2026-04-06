@@ -1,19 +1,19 @@
 import os
 import asyncio
-import re
 import logging
 import sys
 import io
 import json
-from dataclasses import dataclass, field
+import random
+from dataclasses import dataclass
 from typing import List, Optional, Dict, Set, Tuple
 from datetime import datetime, timedelta, timezone
-from telethon import TelegramClient, events, utils, Button
+from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import UpdateMessageReactions
 from telethon.errors import (
     ChatWriteForbiddenError, UserBannedInChannelError,
-    AuthKeyError, SessionExpiredError, UserDeactivatedBanError,
+    AuthKeyError, SessionExpiredError,
     FloodWaitError
 )
 import aiohttp as _aiohttp
@@ -33,7 +33,6 @@ from config import (
     PREDICTION_DF_DEFAULT,
     B_INCREMENT_DEFAULT,
     COMPTEUR8_THRESHOLD, COMPTEUR8_DATA_FILE,
-    DATABASE_URL,
 )
 import db as db
 from api_utils import get_latest_results
@@ -72,6 +71,16 @@ suit_block_until: Dict[str, datetime] = {}
 # Suivi santé API 1xBet
 last_api_success_time: Optional[datetime] = None
 api_silence_alerted: bool = False  # évite de spammer l'admin
+
+# Suivi formation : stocke la dernière meilleure formation ("f1", "f2", "f3", None)
+_last_formation_best: Optional[str] = None
+
+# Formation follow-up : {game_to_check: {recommended_suit, canal_msg_id, original_game, ...}}
+formation_follow_ups: Dict[int, dict] = {}
+
+# Compteur de prédictions résolues — rapport formation auto tous les 10
+_resolved_predictions_count: int = 0
+FORMATION_AUTO_EVERY = 10   # envoyer le rapport tous les N prédictions résolues
 
 # Historique API des jeux
 game_history: Dict[int, dict] = {}
@@ -412,7 +421,7 @@ def generate_compteur4_pdf(events_list: List[Dict]) -> bytes:
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
     pdf.cell(0, 6,
-        f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
+        'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
         f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     return bytes(pdf.output())
@@ -429,7 +438,7 @@ async def send_compteur4_threshold_alert(suit: str, game_number: int, start_game
         emoji = suit_emoji_map.get(suit, suit)
         name  = suit_names_map.get(suit, suit)
         msg = (
-            f"🚨 **COMPTEUR 4 — SEUIL ATTEINT**\n\n"
+            "🚨 **COMPTEUR 4 — SEUIL ATTEINT**\n\n"
             f"{now.strftime('%d/%m/%Y')} à {now.strftime('%Hh%M')} "
             f"{emoji} **{COMPTEUR4_THRESHOLD} fois absent** — numéro **{start_game}_{game_number}**\n\n"
             f"_{name} absent depuis le jeu #{start_game}. La série continue…_"
@@ -452,12 +461,12 @@ async def send_compteur4_series_alert(series: Dict):
         name     = suit_names_map.get(suit, suit)
         end_time = series['end_time']
         msg = (
-            f"🔴 **COMPTEUR 4 — SÉRIE TERMINÉE**\n\n"
+            "🔴 **COMPTEUR 4 — SÉRIE TERMINÉE**\n\n"
             f"{end_time.strftime('%d/%m/%Y')} à {end_time.strftime('%Hh%M')} "
             f"{emoji} **{series['count']} fois** du numéro "
             f"**{series['start_game']}_{series['end_game']}**\n\n"
             f"_{name} absent {series['count']} fois consécutives._\n\n"
-            f"📄 PDF mis à jour ci-dessous."
+            "📄 PDF mis à jour ci-dessous."
         )
         await client.send_message(admin_entity, msg, parse_mode='markdown')
     except Exception as e:
@@ -489,10 +498,10 @@ async def send_compteur4_pdf():
             compteur4_pdf_msg_id = None
 
         caption = (
-            f"🔴 **COMPTEUR4 — PDF mis à jour**\n\n"
+            "🔴 **COMPTEUR4 — PDF mis à jour**\n\n"
             f"Total séries d'absences enregistrées : **{len(compteur4_events)}**\n"
             f"Seuil : **≥ {COMPTEUR4_THRESHOLD}** absences consécutives\n"
-            f"⚠️ Ce PDF persiste entre tous les resets\n"
+            "⚠️ Ce PDF persiste entre tous les resets\n"
             f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
         )
 
@@ -663,7 +672,7 @@ async def send_compteur5_pdf():
             compteur5_pdf_msg_id = None
 
         caption = (
-            f"✅ **COMPTEUR5 — PDF mis à jour**\n\n"
+            "✅ **COMPTEUR5 — PDF mis à jour**\n\n"
             f"Total présences consécutives enregistrées : **{len(compteur5_events)}**\n"
             f"Seuil actuel : **{COMPTEUR5_THRESHOLD}** présences consécutives\n"
             f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
@@ -674,7 +683,7 @@ async def send_compteur5_pdf():
             attributes=[], file_name="compteur5_presences.pdf"
         )
         compteur5_pdf_msg_id = sent.id
-        logger.info(f"✅ PDF Compteur5 envoyé à l'admin")
+        logger.info("✅ PDF Compteur5 envoyé à l'admin")
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur5_pdf: {e}")
         import traceback; logger.error(traceback.format_exc())
@@ -700,28 +709,6 @@ def _group_hours_into_ranges(sorted_hours: List[int]) -> List[Tuple[int, int]]:
     return ranges
 
 
-def _analyse_perdu_heures(events: List[Dict]) -> List[str]:
-    """Analyse les heures de perte et retourne des conseils (plages à éviter)."""
-    from collections import Counter
-    if not events:
-        return []
-    hour_counts = Counter(ev['time'].hour for ev in events)
-    total = len(events)
-    danger_hours = sorted(
-        [h for h, c in hour_counts.items() if c >= 2 or (total > 0 and c / total >= 0.2)],
-        key=lambda h: -hour_counts[h]
-    )
-    if not danger_hours:
-        return []
-    ranges = _group_hours_into_ranges(sorted(danger_hours))
-    conseils = []
-    for s, e in ranges:
-        label = f"{s:02d}h-{e+1:02d}h" if s != e else f"{s:02d}h-{s+1:02d}h"
-        count = sum(hour_counts[h] for h in range(s, e + 1))
-        conseils.append(f"De {label} : {count} perte(s) enregistree(s)")
-    return conseils
-
-
 def _analyse_perdu_dates(events: List[Dict]) -> Dict:
     """
     Analyse croisée des pertes par date ET par heure.
@@ -735,7 +722,6 @@ def _analyse_perdu_dates(events: List[Dict]) -> Dict:
       - dates_analysees : liste des dates impliquées
     """
     from collections import defaultdict, Counter
-    DAYS_FR = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
     if not events:
         return {
@@ -792,20 +778,20 @@ def _analyse_perdu_dates(events: List[Dict]) -> Dict:
             rec = (
                 f"D'apres mes analyses sur {nb_dates} date(s) ({', '.join(dates_analysees)}), "
                 f"les plages a risque sont : {', '.join(danger_labels)}. "
-                f"Je vous conseille de programmer les predictions uniquement sur : "
+                "Je vous conseille de programmer les predictions uniquement sur : "
                 f"{' | '.join(safe_labels)}."
             )
         else:
             rec = (
                 f"D'apres mes analyses sur {nb_dates} date(s) ({', '.join(dates_analysees)}), "
-                f"des pertes ont ete detectees a presque toutes les heures. "
-                f"Aucune plage vraiment sure n'a pu etre identifiee. "
-                f"Reduisez la frequence des predictions."
+                "des pertes ont ete detectees a presque toutes les heures. "
+                "Aucune plage vraiment sure n'a pu etre identifiee. "
+                "Reduisez la frequence des predictions."
             )
     else:
         rec = (
             f"Analyse sur {nb_dates} date(s) : aucun pattern horaire repetitif detecte. "
-            f"Les pertes sont bien distribuees sur la journee — pas de plage a eviter en particulier."
+            "Les pertes sont bien distribuees sur la journee — pas de plage a eviter en particulier."
         )
 
     return {
@@ -857,8 +843,8 @@ def _build_admin_notification(events: List[Dict], date_analysis: Dict) -> str:
             for s, e in safe_ranges
         ]
         lines.append(
-            f"💡 **Conseil** : La plupart des heures analysées ne sont pas favorables. "
-            f"Je vous conseille de programmer vos prédictions en définissant "
+            "💡 **Conseil** : La plupart des heures analysées ne sont pas favorables. "
+            "Je vous conseille de programmer vos prédictions en définissant "
             f"**{' | '.join(safe_labels)}** d'après mes analyses des dates : "
             f"{', '.join(date_analysis['dates_analysees'])}."
         )
@@ -878,7 +864,6 @@ def generate_perdu_pdf(events: List[Dict]) -> bytes:
     pdf.add_page()
 
     suit_names = {'♠': 'Pique', '♥': 'Coeur', '♦': 'Carreau', '♣': 'Trefle'}
-    DAYS_FR = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche']
 
     def section_header(title: str, r: int, g: int, b: int):
         pdf.ln(8)
@@ -1099,11 +1084,11 @@ async def send_perdu_pdf():
 
         # 2. Envoyer le PDF de comparaison
         caption = (
-            f"📊 **ANALYSE COMPLÈTE DES PERTES**\n\n"
+            "📊 **ANALYSE COMPLÈTE DES PERTES**\n\n"
             f"Total pertes: **{len(perdu_events)}**\n"
             f"Dates analysées: **{len(date_analysis['dates_analysees'])}**\n"
             f"Mis à jour: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
-            f"_Comparaison croisée heures × dates incluse._"
+            "_Comparaison croisée heures × dates incluse._"
         )
         sent = await client.send_file(
             admin_entity, buf,
@@ -1112,7 +1097,7 @@ async def send_perdu_pdf():
             file_name="perdu_analyse_complete.pdf"
         )
         perdu_pdf_msg_id = sent.id
-        logger.info(f"✅ Notification + PDF comparaison envoyés à l'admin")
+        logger.info("✅ Notification + PDF comparaison envoyés à l'admin")
     except Exception as e:
         logger.error(f"❌ Erreur send_perdu_pdf: {e}")
 
@@ -1153,11 +1138,11 @@ def get_bilan_text() -> str:
     total_big = _number_to_big(total)
     lines = [
         "╔══════════════════════════════╗",
-        f"║  📊 TOTAL PRÉDICTIONS        ║",
+        "║  📊 TOTAL PRÉDICTIONS        ║",
         f"║       {total_big}",
         "╚══════════════════════════════╝",
-        f"",
-        f"📈 **BILAN DES PRÉDICTIONS**",
+        "",
+        "📈 **BILAN DES PRÉDICTIONS**",
         f"🕒 {now}",
         "━" * 30,
         f"✅0️⃣ GAGNÉ DIRECT : **{counts['r0']}** ({pct(counts['r0'])})",
@@ -1253,12 +1238,12 @@ def _suit_stats_block(suit: str, s: dict, rank: int) -> list:
     bar   = _bar(pct)
     return [
         f"{medal} {em} {icon} **{name.upper()}**",
-        f"┌─ Victoires ──────────────────────┐",
+        "┌─ Victoires ──────────────────────┐",
         f"│  ✅ Direct : {r0:<5}  🔄 R1 : {r1:<5} │",
         f"│  🔄 R2     : {r2:<5}  🔄 R3 : {r3:<5} │",
         f"│  ❌ Perdus : {lost:<5}  📦 Total: {total:<4}│",
         f"│  🎯 {bar} **{pct:>5.1f}%**      │",
-        f"└──────────────────────────────────┘",
+        "└──────────────────────────────────┘",
     ]
 
 
@@ -1349,9 +1334,9 @@ def get_concours_par_costume_text() -> tuple:
         "",
         f"   {winner_em} {winner_icon}",
         f"🥇 **{winner_name.upper()}**",
-        f"   règne sur ce cycle !",
+        "   règne sur ce cycle !",
         "",
-        f"📊 Taux de réussite",
+        "📊 Taux de réussite",
         f"   {winner_bar} **{winner_pct:.1f}%**",
     ]
     if winner_tot > 0:
@@ -1396,7 +1381,7 @@ def get_concours_par_costume_text() -> tuple:
                 f"🔁 {winner_em}{winner_icon} **{winner_name.upper()} CONFIRME SA DOMINATION !**",
                 f"Déjà champion au cycle précédent ({prev_pct:.1f}%),",
                 f"il récidive avec **{winner_pct:.1f}%** — une constance redoutable !",
-                f"Les rivaux devront se surpasser pour le détrôner.",
+                "Les rivaux devront se surpasser pour le détrôner.",
             ]
         else:
             diff  = winner_pct - prev_pct
@@ -1410,7 +1395,7 @@ def get_concours_par_costume_text() -> tuple:
                 f"avec **{winner_pct:.1f}%** — {trend}",
                 "",
                 f"👉 {prev_em} {prev_name} cède sa couronne ce cycle.",
-                f"   La revanche est-elle pour le prochain ? 🔥",
+                "   La revanche est-elle pour le prochain ? 🔥",
             ]
     else:
         lines2 += [
@@ -1472,7 +1457,7 @@ async def bilan_loop():
 
 
 ROLLING_WINDOW = 30   # nombre de dernières prédictions pour le score glissant
-MIN_ROLLING    = 3    # minimum pour être éligible
+MIN_ROLLING    = 1    # minimum pour être éligible (1 prédiction suffit)
 
 
 def _rolling_score(state: dict, window: int = ROLLING_WINDOW):
@@ -1508,8 +1493,18 @@ async def auto_strategy_hourly_loop():
             best_key        = None
             best_score      = None
             best_wins       = 0
+            best_losses_cap = 0
+            best_recent_cap = 0
             best_val        = None
-            best_per_mirror = {}   # pour affichage uniquement (sans filtre perte)
+            best_per_mirror = {}   # pour affichage uniquement
+
+            fallback_key      = None   # meilleur avec le moins de pertes
+            fallback_min_loss = float('inf')
+            fallback_max_wins = 0
+            fallback_score    = None
+            fallback_wins_cap = 0
+            fallback_loss_cap = 0
+            fallback_recent_cap = 0
 
             for key, state in silent_combo_states.items():
                 combo_num, wx, b, df_sim = key
@@ -1519,13 +1514,24 @@ async def auto_strategy_hourly_loop():
 
                 # ── Sélection principale : UNIQUEMENT les combos sans aucune perte ──
                 if losses == 0:
-                    # score = wins (puisque losses=0) → on prend le plus de wins
                     if best_key is None or wins > best_wins or (
                             wins == best_wins and score > (best_score or 0)):
-                        best_key   = key
-                        best_score = score
-                        best_wins  = wins
-                        best_val   = state
+                        best_key        = key
+                        best_score      = score
+                        best_wins       = wins
+                        best_losses_cap = losses
+                        best_recent_cap = recent
+
+                # ── Fallback : min pertes puis max victoires ──────────────────
+                if losses < fallback_min_loss or (
+                        losses == fallback_min_loss and wins > fallback_max_wins):
+                    fallback_key      = key
+                    fallback_min_loss = losses
+                    fallback_max_wins = wins
+                    fallback_score    = score
+                    fallback_wins_cap = wins
+                    fallback_loss_cap = losses
+                    fallback_recent_cap = recent
 
                 # ── Classement par miroir pour la notification (tous combos) ──
                 prev = best_per_mirror.get(combo_num)
@@ -1542,37 +1548,37 @@ async def auto_strategy_hourly_loop():
                 f"({total_preds_before} prédictions de l'heure écoulée effacées)"
             )
 
+            # ── Sélection finale : zéro-perte ou, à défaut, meilleur ratio ──
+            if best_key is None and fallback_key is not None:
+                # Aucun combo sans perte → on utilise le fallback
+                best_key        = fallback_key
+                best_score      = fallback_score
+                best_wins       = fallback_wins_cap
+                best_losses_cap = fallback_loss_cap
+                best_recent_cap = fallback_recent_cap
+                is_fallback     = True
+            else:
+                is_fallback = False
+
             if best_key is None:
-                # Compter combos avec données vs combos avec pertes
-                _with_data   = sum(1 for st in silent_combo_states.values() if st.get('total', 0) >= MIN_ROLLING)
-                _zero_loss   = sum(1 for st in silent_combo_states.values()
-                                   if st.get('total', 0) >= MIN_ROLLING and st.get('losses', 0) == 0)
-                _best_score_fb = max(
-                    (st.get('wins', 0) - st.get('losses', 0)
-                     for st in silent_combo_states.values() if st.get('total', 0) >= MIN_ROLLING),
-                    default=None,
+                # Vraiment aucune donnée suffisante
+                _with_data = sum(
+                    1 for st in silent_combo_states.values()
+                    if st.get('total', 0) >= MIN_ROLLING
                 )
                 logger.info(
-                    f"🕐 [{heure}] Aucun combo sans perte cette heure "
-                    f"({_with_data} combos avec données, {_zero_loss} sans perte)"
+                    f"🕐 [{heure}] Données insuffisantes ({_with_data} combos avec données)"
                 )
                 if ADMIN_ID:
                     try:
-                        msg_no_zero = (
+                        await client.send_message(
+                            ADMIN_ID,
                             f"🕐 **{heure}** — Évaluation horaire terminée\n\n"
                             f"📊 Prédictions silencieuses cette heure : **{total_preds_before}**\n"
-                            f"   Combos avec données (≥{MIN_ROLLING} pred.) : **{_with_data}**\n"
-                            f"   Combos sans aucune perte : **{_zero_loss}**\n\n"
-                            + (
-                                f"⚠️ **Aucun combo sans perte cette heure.**\n"
-                                f"Meilleur score trouvé : **{_best_score_fb:+d}** — "
-                                f"non proposé (critère zéro-perte non atteint).\n"
-                                if _with_data > 0 and _zero_loss == 0
-                                else "ℹ️ Données insuffisantes — accumulation en cours.\n"
-                            )
-                            + "_Les stocks repartent à zéro._"
+                            "ℹ️ Aucun combo n'a encore reçu de prédiction — "
+                            "accumulation en cours.\n"
+                            "_Les stocks repartent à zéro._"
                         )
-                        await client.send_message(ADMIN_ID, msg_no_zero)
                     except Exception:
                         pass
                 continue
@@ -1583,7 +1589,11 @@ async def auto_strategy_hourly_loop():
                 logger.warning(f"🕐 [{heure}] Auto-stratégie horaire : combo_num={combo_num} introuvable")
                 continue
 
-            r_score, r_wins, r_losses, r_recent = _rolling_score(best_val)
+            # Utiliser les valeurs capturées AVANT le reset (pred_history est vide après)
+            r_score  = best_score
+            r_wins   = best_wins
+            r_losses = best_losses_cap
+            r_recent = best_recent_cap
 
             best_auto = {
                 'combo_num':    combo_num,
@@ -1598,6 +1608,7 @@ async def auto_strategy_hourly_loop():
                 'losses':       r_losses,
                 'total':        r_recent,
                 'mirror_ranks': best_per_mirror,
+                'is_fallback':  is_fallback,
             }
 
             logger.info(
@@ -1670,7 +1681,19 @@ async def propose_hourly_strategy(best_auto: dict, heure: str):
             f"Score **{sc:+d}** (✅{w} ❌{l} / {rc} pred.)"
         )
 
-    new_df_sim = best_auto.get('df_sim', 1)
+    new_df_sim  = best_auto.get('df_sim', 1)
+    is_fallback = best_auto.get('is_fallback', False)
+
+    if is_fallback:
+        quality_line = (
+            "⚠️ _Aucun combo sans perte cette heure — meilleur ratio disponible "
+            f"(❌{best_auto['losses']} perte(s) sur {best_auto['total']} pred.)._"
+        )
+        badge = "🥈 Meilleur ratio disponible"
+    else:
+        quality_line = "✅ _Combo sans aucune perte cette heure._"
+        badge        = "🏆 Meilleure configuration (0 perte)"
+
     lines = [
         "╔══════════════════════════════════╗",
         f"║  🕐 PROPOSITION HORAIRE — {heure}  ║",
@@ -1679,13 +1702,14 @@ async def propose_hourly_strategy(best_auto: dict, heure: str):
         "📊 **Classement des 3 miroirs (heure écoulée) :**",
     ] + detail_lines + [
         "",
-        "🏆 **Meilleure configuration proposée :**",
+        f"**{badge} :**",
         f"  Miroir : **{best_auto['name']}** ({best_auto['disp']})",
         f"  wx C13 : **{best_auto['wx']}** consécutives",
         f"  B  C2  : **{best_auto['b']}** absences",
         f"  df     : **trigger+{new_df_sim}**",
         f"  Score  : **{best_auto['score']:+d}** pts (✅{best_auto['wins']} ❌{best_auto['losses']} / {best_auto['total']} pred.)",
         "",
+        quality_line,
         "⚠️ _Les stocks silencieux ont été remis à zéro. Nouveau départ._",
         "",
         "👇 Confirme pour appliquer cette stratégie maintenant :",
@@ -1796,11 +1820,11 @@ async def trigger_favorable_window_from_c4():
 
         # ── Annonce texte ─────────────────────────────────────────────────────
         annonce = (
-            f"⏰ **HEURE FAVORABLE DÉTECTÉE**\n\n"
+            "⏰ **HEURE FAVORABLE DÉTECTÉE**\n\n"
             f"🟢 Créneau : **{interval_str}** _(Côte d'Ivoire)_\n"
             f"⏳ Durée : **{duree_str}**\n"
             f"📊 Raison : {raison_str}\n\n"
-            f"_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
+            "_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
         )
         await client.send_message(canal_entity, annonce, parse_mode='markdown')
         logger.info(f"⏰ Heure favorable annoncée : {interval_str} ({duree_str})")
@@ -1836,7 +1860,7 @@ async def trigger_favorable_window_from_c4():
                 await client.send_message(
                     admin_entity,
                     (
-                        f"⏰ **Heure favorable déclenchée (C4×2)**\n"
+                        "⏰ **Heure favorable déclenchée (C4×2)**\n"
                         f"Créneau : **{interval_str}** | Durée : {duree_str}\n"
                         f"Raison : {raison_str}\n"
                         f"C14 : {dict(compteur14_counts)} ({compteur14_cycle_games} jeux)"
@@ -1848,22 +1872,6 @@ async def trigger_favorable_window_from_c4():
 
     except Exception as e:
         logger.error(f"❌ trigger_favorable_window_from_c4: {e}")
-
-
-def _temps_restant(now_ci: 'datetime', next_hour: int) -> str:
-    """Temps restant jusqu'à next_hour (0-23), en heures et minutes réelles."""
-    now_min = now_ci.hour * 60 + now_ci.minute
-    nxt_min = next_hour * 60
-    diff_min = (nxt_min - now_min) % (24 * 60)
-    if diff_min == 0:
-        return "maintenant"
-    h, m = divmod(diff_min, 60)
-    if h > 0 and m > 0:
-        return f"dans {h}h {m}min"
-    elif h > 0:
-        return f"dans {h}h"
-    else:
-        return f"dans {m}min"
 
 
 # ── Compte à rebours heures favorables ──────────────────────────────────────
@@ -1900,14 +1908,14 @@ def _build_countdown_panel(interval_str: str, minutes_left: int,
 
     panel = (
         f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}\n"
-        f"🟦                              🟦\n"
-        f"🟦   ⏰ **HEURE FAVORABLE**   🟦\n"
+        "🟦                              🟦\n"
+        "🟦   ⏰ **HEURE FAVORABLE**   🟦\n"
         f"🟦   🕐 _{interval_str}_   🟦\n"
-        f"🟦   🇨🇮 _(heure Côte d'Ivoire)_   🟦\n"
+        "🟦   🇨🇮 _(heure Côte d'Ivoire)_   🟦\n"
         f"🟦   ⏳ Dans **{temps}**   🟦\n"
-        f"🟦                              🟦\n"
+        "🟦                              🟦\n"
         f"{corner}🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦{corner}\n"
-        f"\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
+        "\n_En Dieu nous comptons, Sossou Kouamé prediction 🔥_"
     )
     return panel
 
@@ -1960,7 +1968,7 @@ async def _heures_fav_countdown_runner(msg_id: int, canal_entity,
             if remaining <= 0 or elapsed_sec >= MAX_AGE:
                 try:
                     await client.delete_messages(canal_entity, [msg_id])
-                    logger.info(f"🟦 Countdown heure favorable supprimé (arrivé ou expiré)")
+                    logger.info("🟦 Countdown heure favorable supprimé (arrivé ou expiré)")
                 except Exception:
                     pass
                 heures_fav_countdown_msg_id = None
@@ -2386,7 +2394,7 @@ async def send_compteur14_report(game_number: int, is_final: bool = True):
             f"📊 **COMPTEUR 14 — {'BILAN CYCLE COMPLET' if is_final else 'ÉTAT INTERMÉDIAIRE'}**\n"
             f"Jeux #{compteur14_cycle_start} → #{game_number} "
             f"({compteur14_cycle_games}/{COMPTEUR14_CYCLE_SIZE})\n\n"
-            f"**Apparitions par costume (main joueur) :**\n"
+            "**Apparitions par costume (main joueur) :**\n"
         )
 
         lines = []
@@ -2596,26 +2604,50 @@ def update_silent_combos(game_number: int, player_suits: Set[str]):
         combo_num, wx, b, df_sim = key
         mirror = GLOBAL_COMBOS_BY_NUM[combo_num]['mirror']
 
-        # ── 1. Résoudre les prédictions en attente ──────────────────────────
+        # ── 1. Résoudre les prédictions en attente (avec rattrapage R0→R1→R2) ─
         still_pending = []
         for pred in state['pending']:
-            pg = pred['pred_game']
+            pg          = pred['pred_game']
+            rattrapage  = pred.get('rattrapage', 0)
             if pg == game_number:
                 won = pred['suit'] in player_suits
-                state['wins' if won else 'losses'] += 1
-                state['total'] += 1
-                hist = {
-                    'gn':      game_number,
-                    'suit':    pred['suit'],
-                    'trigger': pred['trigger'],
-                    'win':     won,
-                    'df_sim':  df_sim,
-                }
-                state['pred_history'].append(hist)
-                if len(state['pred_history']) > 60:
-                    state['pred_history'].pop(0)
+                if won:
+                    # ✅ Victoire (peu importe le rattrapage)
+                    state['wins']  += 1
+                    state['total'] += 1
+                    hist = {
+                        'gn':      game_number,
+                        'suit':    pred['suit'],
+                        'trigger': pred['trigger'],
+                        'win':     True,
+                        'r':       rattrapage,
+                        'df_sim':  df_sim,
+                    }
+                    state['pred_history'].append(hist)
+                    if len(state['pred_history']) > 60:
+                        state['pred_history'].pop(0)
+                elif rattrapage < 2:
+                    # ❌ Échec — passage au rattrapage suivant (R1 ou R2)
+                    pred['pred_game']  = game_number + 1
+                    pred['rattrapage'] = rattrapage + 1
+                    still_pending.append(pred)
+                else:
+                    # ❌ Perdu définitivement (R2 épuisé)
+                    state['losses'] += 1
+                    state['total']  += 1
+                    hist = {
+                        'gn':      game_number,
+                        'suit':    pred['suit'],
+                        'trigger': pred['trigger'],
+                        'win':     False,
+                        'r':       2,
+                        'df_sim':  df_sim,
+                    }
+                    state['pred_history'].append(hist)
+                    if len(state['pred_history']) > 60:
+                        state['pred_history'].pop(0)
             elif pg < game_number:
-                # jeu passé sans résolution → perdu
+                # Jeu attendu sauté par l'API → perte immédiate
                 state['losses'] += 1
                 state['total']  += 1
                 hist = {
@@ -2623,6 +2655,7 @@ def update_silent_combos(game_number: int, player_suits: Set[str]):
                     'suit':    pred['suit'],
                     'trigger': pred['trigger'],
                     'win':     False,
+                    'r':       rattrapage,
                     'df_sim':  df_sim,
                 }
                 state['pred_history'].append(hist)
@@ -2653,9 +2686,10 @@ def update_silent_combos(game_number: int, player_suits: Set[str]):
                     if c2_abs < b:
                         # C2 ne bloque pas → prédiction silencieuse
                         state['pending'].append({
-                            'pred_game': game_number + df_sim,
-                            'suit':      mirror_suit,
-                            'trigger':   game_number,
+                            'pred_game':  game_number + df_sim,
+                            'suit':       mirror_suit,
+                            'trigger':    game_number,
+                            'rattrapage': 0,
                         })
                     # Reset C13 après déclenchement (qu'il soit bloqué ou non)
                     state['c13'][suit]       = 0
@@ -2719,7 +2753,7 @@ async def send_compteur13_alert(trigger: Dict, current_game: int):
             f"C13 : {consec_disp} apparu {count} fois de suite "
             f"(jeux #{game_start}→#{game_trigger}, seuil wx={COMPTEUR13_THRESHOLD}). "
             f"Miroir prédit : {miroir_disp} au jeu #{pred_game}. "
-            f"C2 vérifié (miroir non bloqué) → prédiction lancée."
+            "C2 vérifié (miroir non bloqué) → prédiction lancée."
         )
 
         c13_meta = {
@@ -2912,12 +2946,12 @@ async def send_compteur8_series_alert(series: Dict):
         emoji = suit_emoji_map.get(suit, suit)
         end_t = series['end_time']
         msg = (
-            f"📊 **COMPTEUR 8 — SÉRIE TERMINÉE**\n\n"
+            "📊 **COMPTEUR 8 — SÉRIE TERMINÉE**\n\n"
             f"{end_t.strftime('%d/%m/%Y')} à {end_t.strftime('%Hh%M')} "
             f"{emoji} **{series['count']} fois** du numéro "
             f"**{series['start_game']}_{series['end_game']}**\n\n"
             f"_{suit_names_map.get(suit, suit)} absent {series['count']} fois consécutives._\n\n"
-            f"📄 PDF mis à jour ci-dessous."
+            "📄 PDF mis à jour ci-dessous."
         )
         admin_entity = await client.get_entity(ADMIN_ID)
         await client.send_message(admin_entity, msg, parse_mode='markdown')
@@ -2985,10 +3019,10 @@ async def send_compteur8_pdf():
             compteur8_pdf_msg_id = None
 
         caption = (
-            f"📊 **COMPTEUR8 vs COMPTEUR7 — PDF mis à jour**\n\n"
+            "📊 **COMPTEUR8 vs COMPTEUR7 — PDF mis à jour**\n\n"
             f"C8 absences (≥{COMPTEUR8_THRESHOLD}x) : **{len(compteur8_completed)}** série(s)\n"
             f"C7 présences (≥{COMPTEUR7_THRESHOLD}x) : **{len(compteur7_completed)}** série(s)\n"
-            f"⚠️ Ce PDF persiste entre tous les resets\n"
+            "⚠️ Ce PDF persiste entre tous les resets\n"
             f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
         )
         sent = await client.send_file(
@@ -3382,7 +3416,7 @@ def generate_compteur7_pdf() -> bytes:
     pdf.set_font('Helvetica', 'I', 9)
     pdf.set_text_color(130, 130, 130)
     pdf.cell(0, 6,
-        f'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
+        'BACCARAT AI - PERSISTANT - Reset #1440 ne supprime PAS ce fichier - '
         f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C'
     )
     return bytes(pdf.output())
@@ -3400,12 +3434,12 @@ async def send_compteur7_alert(series: Dict):
         emoji    = suit_emoji_map.get(suit, suit)
         end_time = series['end_time']
         msg = (
-            f"📊 **COMPTEUR 7 — SÉRIE TERMINÉE**\n\n"
+            "📊 **COMPTEUR 7 — SÉRIE TERMINÉE**\n\n"
             f"{end_time.strftime('%d/%m/%Y')} à {end_time.strftime('%Hh%M')} "
             f"{emoji} **{series['count']} fois** du numéro "
             f"**{series['start_game']}_{series['end_game']}**\n\n"
             f"_{suit_names_map.get(suit, suit)} présent {series['count']} fois consécutives._\n\n"
-            f"📄 PDF mis à jour ci-dessous."
+            "📄 PDF mis à jour ci-dessous."
         )
         await client.send_message(admin_entity, msg, parse_mode='markdown')
     except Exception as e:
@@ -3431,10 +3465,10 @@ async def send_compteur7_pdf():
             compteur7_pdf_msg_id = None
 
         caption = (
-            f"📊 **COMPTEUR7 — PDF mis à jour**\n\n"
+            "📊 **COMPTEUR7 — PDF mis à jour**\n\n"
             f"Total séries enregistrées : **{len(compteur7_completed)}**\n"
             f"Seuil : **≥ {COMPTEUR7_THRESHOLD}** présences consécutives\n"
-            f"⚠️ Ce PDF persiste entre tous les resets\n"
+            "⚠️ Ce PDF persiste entre tous les resets\n"
             f"Mis à jour : {datetime.now().strftime('%d/%m/%Y %Hh%M')}"
         )
         sent = await client.send_file(
@@ -3443,7 +3477,7 @@ async def send_compteur7_pdf():
             attributes=[], file_name="compteur7_series.pdf"
         )
         compteur7_pdf_msg_id = sent.id
-        logger.info(f"✅ PDF Compteur7 envoyé à l'admin")
+        logger.info("✅ PDF Compteur7 envoyé à l'admin")
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur7_pdf: {e}")
         import traceback; logger.error(traceback.format_exc())
@@ -3469,6 +3503,37 @@ def get_player_suits(player_cards: list) -> Set[str]:
         if normalized in ALL_SUITS:
             suits.add(normalized)
     return suits
+
+
+def _is_player_hand_complete(player_cards: list) -> bool:
+    """
+    Retourne True quand le joueur a FINI de tirer ses cartes.
+    Le banquier ne nous concerne pas — on traite dès que le joueur est terminé.
+
+    Règles Baccara :
+      - ≥ 3 cartes joueur  → a tiré la 3ème (main définitive)
+      - 2 cartes, score 6-7 → reste (ne tirera pas de 3ème carte)
+      - 2 cartes, score 8-9 → naturelle (tirage impossible)
+      - 2 cartes, score 0-5 → le joueur VA tirer → on attend encore
+      - < 2 cartes          → distribution en cours → on attend
+    """
+    n = len(player_cards)
+    if n >= 3:
+        return True  # 3ème carte déjà tirée → joueur définitivement terminé
+    if n == 2:
+        score = 0
+        for c in player_cards:
+            r = c.get('R', 0)
+            try:
+                r = int(r)
+            except (TypeError, ValueError):
+                r = 0
+            # Valeur baccara : as=1, 2-9=face, 10/J/Q/K=0
+            score += r if 1 <= r <= 9 else 0
+        score %= 10
+        # Score 6 ou 7 → joueur reste  |  8 ou 9 → naturelle
+        return score >= 6
+    return False  # moins de 2 cartes → distribution non terminée
 
 # ============================================================================
 # CLASSES TRACKERS
@@ -3599,7 +3664,7 @@ def add_prediction_to_history(game_number: int, suit: str, verification_games: L
 
 
 def update_prediction_in_history(game_number: int, suit: str, verified_by_game: int, rattrapage_level: int, final_status: str):
-    global prediction_history
+    global prediction_history, _resolved_predictions_count
     for pred in prediction_history:
         if pred['predicted_game'] == game_number and pred['suit'] == suit:
             pred['status'] = final_status
@@ -3608,6 +3673,15 @@ def update_prediction_in_history(game_number: int, suit: str, verified_by_game: 
             pred['rattrapage_level'] = rattrapage_level
             db.db_schedule(db.db_update_prediction_history(game_number, suit, final_status, rattrapage_level, verified_by_game))
             break
+
+    # ── Rapport formation auto : tous les FORMATION_AUTO_EVERY prédictions résolues ──
+    # On compte seulement les résultats définitifs (gagne ou perdu), pas les expirations API.
+    if final_status.startswith('gagne') or final_status == 'perdu':
+        _resolved_predictions_count += 1
+        logger.info(f"📊 Prédictions résolues : {_resolved_predictions_count} (seuil auto-formation : {FORMATION_AUTO_EVERY})")
+        if _resolved_predictions_count % FORMATION_AUTO_EVERY == 0:
+            logger.info(f"📢 Seuil {FORMATION_AUTO_EVERY} atteint → envoi automatique du rapport formation au canal")
+            asyncio.ensure_future(_send_formation_to_canal())
 
 def save_pending_predictions():
     """Sauvegarde les prédictions en attente dans PostgreSQL."""
@@ -3768,7 +3842,7 @@ async def load_strategy_simulation():
         ts = last_strategy_simulation.get('timestamp', '')
         total_c13 = last_strategy_simulation.get('total_c13', 0)
         logger.info(
-            f"📂 Simulation silencieuse chargée depuis DB "
+            "📂 Simulation silencieuse chargée depuis DB "
             f"({total_c13} prédictions C13 · {ts})"
         )
     except Exception as e:
@@ -4046,7 +4120,7 @@ async def load_runtime_config():
     heures_favorables_active    = _get('heures_favorables_active',    heures_favorables_active)
 
     logger.info(
-        f"⚙️ Config runtime restaurée depuis DB — "
+        "⚙️ Config runtime restaurée depuis DB — "
         f"C3:{PREDICTION_CHANNEL_ID3} | C4:{PREDICTION_CHANNEL_ID4} | "
         f"Dist:{DISTRIBUTION_CHANNEL_ID} | C2ch:{COMPTEUR2_CHANNEL_ID} | "
         f"Écart:{MIN_GAP_BETWEEN_PREDICTIONS} | "
@@ -4260,12 +4334,14 @@ async def _run_animation(original_game: int, check_game: int, start_frame: int =
             level_label  = level_labels[min(rattrapage, 3)]
             dots = '.' * ((frame % 3) + 1)
 
+            formation_suffix = pred.get('formation_suffix', '')
             msg = (
                 f"🎰 **PRÉDICTION #{original_game}**\n"
                 f"🎯 Couleur: {suit_display}\n\n"
                 f"🔍 Vérification jeu **#{check_game}** — {level_label}\n"
                 f"`{bar}`\n"
                 f"⏳ _Analyse{dots}_"
+                f"{formation_suffix}"
             )
 
             await safe_edit_message(
@@ -4347,7 +4423,7 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
         return (
             f"🎰 PRÉDICTION #{game_number}\n"
             f"🎯 Couleur: {suit_display}\n"
-            f"📊 Statut: En cours ⏳\n"
+            "📊 Statut: En cours ⏳\n"
             f"🔍 Vérification: {verif_line}"
         )
 
@@ -4364,14 +4440,14 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
         return (
             f"💔 **PRÉDICTION #{game_number}**\n\n"
             f"🎯 **Couleur:** {suit_display}\n"
-            f"❌ **Statut:** PERDU 😭"
+            "❌ **Statut:** PERDU 😭"
         )
 
     elif status == 'expirée_api':
         return (
             f"⚠️ **PRÉDICTION #{game_number}**\n\n"
             f"🎯 **Couleur:** {suit_display}\n"
-            f"🔌 **Statut:** EXPIRÉ — jeu sauté par l'API"
+            "🔌 **Statut:** EXPIRÉ — jeu sauté par l'API"
         )
 
     return ""
@@ -4561,18 +4637,6 @@ async def send_parole_auto_delete(statut_key: str, game_number: int):
             logger.debug(f"send_parole_auto_delete #{game_number} canal {ch_id}: {e}")
 
 
-async def auto_delete_canal_message(msg_id: int, delay_seconds: int = 1800):
-    """Supprime automatiquement un message du canal après 30 min (1800s)."""
-    await asyncio.sleep(delay_seconds)
-    try:
-        entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if entity:
-            await client.delete_messages(entity, [msg_id])
-            logger.info(f"🗑️ Message canal #{msg_id} supprimé (auto après {delay_seconds // 60} min)")
-    except Exception as e:
-        logger.debug(f"auto_delete_canal_message #{msg_id}: {e}")
-
-
 async def update_prediction_message(game_number: int, status: str, rattrapage: int = 0):
     if game_number not in pending_predictions:
         return
@@ -4637,7 +4701,7 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
         else:
             logger.warning(
                 f"⚠️ update_prediction_message #{game_number}: msg_id manquant "
-                f"→ envoi du résultat en nouveau message"
+                "→ envoi du résultat en nouveau message"
             )
             try:
                 await client.send_message(prediction_entity, new_msg, parse_mode='markdown')
@@ -4739,6 +4803,9 @@ async def update_prediction_progress(game_number: int, current_check: int):
     start_frame = BAR_MAX_BY_RATTRAPAGE[min(prev_rattrapage, len(BAR_MAX_BY_RATTRAPAGE) - 1)]
     start_animation(game_number, current_check, start_frame)
     msg = format_prediction_message(game_number, suit, 'en_cours', current_check, verified_games)
+    formation_suffix = pred.get('formation_suffix', '')
+    if formation_suffix:
+        msg += formation_suffix
     prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
     if prediction_entity:
         await safe_edit_message(prediction_entity, msg_id, msg,
@@ -4835,7 +4902,7 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
         if game_number > original_game + 8:
             logger.warning(
                 f"⏰ Timeout #{original_game} R{rattrapage}: {game_number - original_game} jeux "
-                f"sans résolution → suppression du canal"
+                "sans résolution → suppression du canal"
             )
             stop_animation(original_game)
             msg_id  = pred.get('message_id')
@@ -4850,6 +4917,10 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                             await client.delete_messages(_ent, [_mid])
                     except Exception as _e:
                         logger.debug(f"Suppression message timeout #{original_game} canal {_ch_id}: {_e}")
+            # Nettoyage de toute entrée formation_follow_ups liée à cette prédiction
+            for _fg in list(formation_follow_ups.keys()):
+                if formation_follow_ups[_fg].get('original_game') == original_game:
+                    formation_follow_ups.pop(_fg, None)
             del pending_predictions[original_game]
             save_pending_predictions()
             update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
@@ -4913,17 +4984,23 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
 
         elif check_finished:
             pred['verified_games'].append(check_game)
-            if rattrapage < 3:
+            if rattrapage < 2:
                 # Intermédiaire : passage au rattrapage suivant — cache conservé
                 pred['rattrapage'] = rattrapage + 1
                 next_check = original_game + rattrapage + 1
                 logger.info(f"❌ R{rattrapage} terminé sans {target_suit}, attente R{rattrapage+1} #{next_check}")
+                # Premier échec (R0) → calculer et afficher la formation de mise
+                if rattrapage == 0:
+                    try:
+                        await _trigger_formation_follow_up(original_game, target_suit, check_game, dict(pred))
+                    except Exception as _fex:
+                        logger.error(f"❌ Formation follow-up #{original_game}: {_fex}")
                 await update_prediction_progress(original_game, next_check)
             else:
-                # ❌ Statut final : PERDU R3 → nettoyer le cache de ce jeu
-                logger.info(f"❌ R3 terminé sans {target_suit}, prédiction PERDUE #{original_game}")
-                await update_prediction_message(original_game, 'perdu', 3)
-                update_prediction_in_history(original_game, target_suit, check_game, 3, 'perdu')
+                # ❌ Statut final : PERDU R2 → nettoyer le cache de ce jeu
+                logger.info(f"❌ R2 terminé sans {target_suit}, prédiction PERDUE #{original_game}")
+                await update_prediction_message(original_game, 'perdu', 2)
+                update_prediction_in_history(original_game, target_suit, check_game, 2, 'perdu')
                 compteur11_add_perdu(original_game, target_suit)
                 game_result_cache.pop(check_game, None)   # nettoyage cache — statut final trouvé
                 found = True
@@ -5051,44 +5128,6 @@ def update_compteur2(game_number: int, player_suits: Set[str]):
         else:
             tracker.increment(game_number)
 
-def get_compteur2_ready_predictions(current_game: int) -> List[tuple]:
-    """
-    Vérifie si le seuil B est atteint pour chaque costume et prépare les prédictions.
-    C2 prédit directement le costume manquant à current_game + PREDICTION_DF.
-    Retourne : (suit, pred_number, reason, trigger_game, skip_c6=True)
-    """
-    global compteur2_trackers, compteur2_seuil_B_per_suit
-    ready = []
-    _suit_text = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
-
-    for suit in ALL_SUITS:
-        tracker = compteur2_trackers[suit]
-        b = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
-        if not tracker.check_threshold(b):
-            continue
-
-        start_game  = tracker.last_increment_game - (tracker.counter - 1)
-        suit_name   = _suit_text.get(suit, suit)
-        pred_number = current_game + PREDICTION_DF
-
-        logger.info(
-            f"📊 C2: {suit_name} absent {tracker.counter}x de suite "
-            f"(jeux #{start_game}→#{tracker.last_increment_game}, seuil B={b}) "
-            f"→ prédit #{pred_number}"
-        )
-
-        reason = (
-            f"C2 : {suit_name} absent {tracker.counter} fois de suite "
-            f"(jeux #{start_game}→#{tracker.last_increment_game}, seuil B={b}). "
-            f"Prédiction au jeu #{pred_number}."
-        )
-
-        # (suit, pred_number, reason, trigger_game, skip_c6)
-        ready.append((suit, pred_number, reason, current_game, True))
-        tracker.reset(current_game)
-
-    return ready
-
 # ============================================================================
 # TRAITEMENT DES JEUX (API)
 # ============================================================================
@@ -5124,9 +5163,9 @@ async def send_bilan_and_reset_at_1440():
         if p.get('status', '') not in ('en_cours', '')
     )
     header = (
-        f"🔔 **FIN DE CYCLE — JEU #1440**\n"
+        "🔔 **FIN DE CYCLE — JEU #1440**\n"
         f"Bilan sur **{total_finalized}** prédiction(s) finalisées.\n"
-        f"Le bot repart à neuf dans 20 secondes.\n\n"
+        "Le bot repart à neuf dans 20 secondes.\n\n"
     )
     # Bilan #1440 → admin uniquement (chat privé)
     if ADMIN_ID and ADMIN_ID != 0:
@@ -5196,9 +5235,9 @@ async def send_bilan_and_reset_at_1440():
             await client.send_file(
                 admin_entity, buf4,
                 caption=(
-                    f"🔴 **COMPTEUR4 — SNAPSHOT FIN DE CYCLE**\n"
+                    "🔴 **COMPTEUR4 — SNAPSHOT FIN DE CYCLE**\n"
                     f"Total séries d'absences : **{len(compteur4_events)}**\n"
-                    f"⚠️ Ces données sont persistantes — elles ne seront PAS effacées au reset"
+                    "⚠️ Ces données sont persistantes — elles ne seront PAS effacées au reset"
                 ),
                 parse_mode='markdown',
                 file_name="compteur4_absences_cycle.pdf"
@@ -5217,9 +5256,9 @@ async def send_bilan_and_reset_at_1440():
             await client.send_file(
                 admin_entity, buf5,
                 caption=(
-                    f"✅ **COMPTEUR5 — PDF FINAL DU CYCLE**\n"
+                    "✅ **COMPTEUR5 — PDF FINAL DU CYCLE**\n"
                     f"Total présences : **{len(compteur5_events)}**\n"
-                    f"_(Sauvegarde avant reset)_"
+                    "_(Sauvegarde avant reset)_"
                 ),
                 parse_mode='markdown',
                 file_name="compteur5_presences_final.pdf"
@@ -5244,7 +5283,6 @@ async def send_bilan_and_reset_at_1440():
     nb_pending = len(pending_predictions)
     nb_queue   = len(prediction_queue)
     nb_history = len(prediction_history)
-    nb_c4      = len(compteur4_events)
     nb_c5      = len(compteur5_events)
     nb_perdu   = len(perdu_events)     # conservé, juste pour le rapport
 
@@ -5302,7 +5340,6 @@ async def send_bilan_and_reset_at_1440():
     # Compteur8 : reset des streaks courants (les séries terminées sont persistantes)
     for suit in ALL_SUITS:
         compteur8_current[suit] = {'count': 0, 'start_game': None, 'start_time': None}
-    compteur8_pdf_msg_id = None
     logger.info("🔄 Compteur8 streaks remis à 0 (séries persistantes conservées)")
 
     # ⚠️ perdu_events N'EST JAMAIS EFFACÉ — comparaison inter-journées préservée
@@ -5322,14 +5359,14 @@ async def send_bilan_and_reset_at_1440():
         try:
             admin_entity = await client.get_entity(ADMIN_ID)
             msg = (
-                f"♻️ **RESET EFFECTUÉ — FIN DU CYCLE #1440**\n\n"
-                f"**Données effacées :**\n"
+                "♻️ **RESET EFFECTUÉ — FIN DU CYCLE #1440**\n\n"
+                "**Données effacées :**\n"
                 f"  • {nb_pending} prédiction(s) en attente\n"
                 f"  • {nb_queue} prédiction(s) en file\n"
                 f"  • {nb_history} entrées d'historique\n"
                 f"  • {nb_c5} événement(s) Compteur5\n"
                 f"  • B par costume remis à B admin ({compteur2_seuil_B})\n\n"
-                f"**Préservé (persistant entre cycles) :**\n"
+                "**Préservé (persistant entre cycles) :**\n"
                 f"  • {nb_perdu} pertes historiques (inter-journées)\n"
                 f"  • {len(compteur4_events)} séries Compteur4 (absences persistantes)\n"
                 f"  • {len(compteur7_completed)} séries Compteur7 (présences ≥{COMPTEUR7_THRESHOLD}) — PDF inchangé\n"
@@ -5338,8 +5375,8 @@ async def send_bilan_and_reset_at_1440():
                 f"  • Seuil Compteur4 : {COMPTEUR4_THRESHOLD}\n"
                 f"  • Seuil Compteur5 : {COMPTEUR5_THRESHOLD}\n"
                 f"  • Restriction horaire : {'Active' if PREDICTION_HOURS else 'Inactive'}\n"
-                f"  • Toutes les configurations admin\n\n"
-                f"✅ Le bot est neuf et prêt pour le prochain cycle."
+                "  • Toutes les configurations admin\n\n"
+                "✅ Le bot est neuf et prêt pour le prochain cycle."
             )
             await client.send_message(admin_entity, msg, parse_mode='markdown')
         except Exception as e:
@@ -5354,22 +5391,73 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         current_game_number = game_number
 
     # ─────────────────────────────────────────────────────────────────────────
-    # player_hand_complete : on attend que le jeu soit ENTIÈREMENT terminé
-    # (banquier ET joueur ont fini) avant de lancer les compteurs et de
-    # prédire le jeu suivant. Cela évite de compter des cartes partielles.
+    # player_hand_complete : vrai dès que le JOUEUR a terminé ses cartes.
+    # Le banquier n'est pas attendu — ses cartes ne concernent pas nos prédictions.
+    #   • ≥ 3 cartes joueur → a tiré la 3ème  → terminé
+    #   • 2 cartes, score ≥ 6 → reste ou naturelle → terminé
+    #   • jeu is_finished → terminé de toute façon (filet de sécurité)
     # ─────────────────────────────────────────────────────────────────────────
-    player_hand_complete = is_finished
+    player_hand_complete = _is_player_hand_complete(player_cards_raw) or is_finished
 
     # Vérification dynamique des prédictions (TOUJOURS — même partie en cours)
     # Victoire immédiate si costume trouvé, échec seulement si partie entièrement terminée
     await check_prediction_result(game_number, player_suits, is_finished)
 
+    # ── Vérification formation follow-up (R0 → R1 → R2, max 2 rattrapages) ──
+    if player_hand_complete and game_number in formation_follow_ups:
+        fup          = formation_follow_ups.pop(game_number)
+        rec_suit     = fup['recommended_suit']
+        orig_game    = fup['original_game']
+        fup_ratt     = fup.get('rattrapage', 0)          # 0, 1 ou 2
+        orig_check   = fup.get('check_game_orig', game_number - 1)
+        rec_disp     = SUIT_DISPLAY.get(rec_suit, rec_suit)
+        active_pred  = pending_predictions.get(orig_game)
+
+        if active_pred:
+            if rec_suit in player_suits:
+                # ✅ Costume trouvé → formation réussie
+                active_pred['formation_suffix'] = (
+                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
+                    "✅ Présent — formation réussie !"
+                )
+                logger.info(f"✅ Formation R{fup_ratt} validée #{orig_game} → {rec_suit} au #{game_number}")
+
+            elif fup_ratt < 2:
+                # ❌ Raté mais encore des rattrapages → on réenregistre pour le jeu suivant
+                next_fup = game_number + 1
+                formation_follow_ups[next_fup] = {
+                    'recommended_suit': rec_suit,
+                    'original_game':    orig_game,
+                    'original_suit':    fup.get('original_suit', rec_suit),
+                    'rattrapage':       fup_ratt + 1,
+                    'check_game_orig':  orig_check,
+                }
+                level_map = {0: '🟩 R1', 1: '🟨 R2'}
+                next_level = level_map.get(fup_ratt, '🟥')
+                active_pred['formation_suffix'] = (
+                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
+                    f"❌ Absent — {next_level} formation → vérif au **#{next_fup}**\n"
+                    "⏳ _Analyse..._"
+                )
+                logger.info(f"❌ Formation R{fup_ratt} ratée #{orig_game} → relance R{fup_ratt+1} au #{next_fup}")
+
+            else:
+                # ❌ R2 raté → formation définitivement perdue
+                active_pred['formation_suffix'] = (
+                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
+                    "❌ Absent — formation définitivement ratée (R2)"
+                )
+                logger.info(f"❌ Formation R2 finale ratée #{orig_game} → {rec_suit} absent au #{game_number}")
+
     # File de prédictions : envoie dès que la main joueur est complète (N+df match)
     await process_prediction_queue(game_number, player_hand_complete)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # COMPTEURS : dès que la main du joueur est complète (2+1 cartes ou jeu fini)
-    # Les costumes du joueur sont définitifs → plus de risque de données partielles.
+    # COMPTEURS : dès que la main JOUEUR est complète (banquier non attendu).
+    #   • 3 cartes joueur → a tiré la 3ème → on enregistre immédiatement
+    #   • 2 cartes, score ≥ 6 → joueur ne tire plus → on enregistre
+    #   • 2 cartes, score 0-5 → joueur va tirer → on attend la 3ème carte
+    # Les costumes du joueur sont définitifs → aucun risque de données partielles.
     # ─────────────────────────────────────────────────────────────────────────
     if player_hand_complete and game_number not in processed_games:
         processed_games.add(game_number)
@@ -5469,12 +5557,11 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
                     _b_pred = compteur2_seuil_B_per_suit.get(_sp13, compteur2_seuil_B)
                     logger.info(
                         f"⛔ C13 #{game_number} {_sp13} bloquée : "
-                        f"miroir prédit est manque bloqué C2 "
+                        "miroir prédit est manque bloqué C2 "
                         f"(absent {compteur2_trackers[_sp13].counter}x ≥ B={_b_pred})"
                     )
                 else:
                     asyncio.create_task(send_compteur13_alert(trig13, game_number))
-                    c13_firing = True   # C13 s'impose → C2 bloqué ce jeu
         elif compteur13_active and c8_blocks_others:
             # Consommer les triggers C13 sans envoyer, noter le blocage
             triggers13_blocked = update_compteur13(game_number, player_suits)
@@ -5499,12 +5586,10 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
         # ── Pré-détection C11 : C11 a-t-il priorité sur ce jeu ? ────────────
         # C11 se déclenche quand game_number == game_number_perdu_hier - PREDICTION_DF
         # Si oui, C2 est bloqué (C11 prioritaire, indépendant de C2 et C6)
-        c11_firing = False
         if compteur11_perdu_hier and is_finished:
             for entry in compteur11_perdu_hier:
                 trigger_at = entry['game_number'] - PREDICTION_DF
                 if game_number == trigger_at:
-                    c11_firing = True
                     break
         # ────────────────────────────────────────────────────────────────────
 
@@ -5539,25 +5624,32 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
 # ============================================================================
 
 async def api_polling_loop():
-    """Boucle principale: interroge l'API 1xBet et traite les résultats."""
+    """
+    Boucle principale : interroge l'API 1xBet et traite les résultats.
+    — Intervalle de base 4s avec jitter aléatoire ±1s pour éviter les patterns détectables
+    — Backoff exponentiel automatique en cas d'échecs consécutifs (max 60s)
+    """
     global game_history, game_result_cache, last_api_success_time, api_silence_alerted
 
-    logger.info("🔄 Démarrage boucle de polling API (toutes les 4s)...")
+    logger.info("🔄 Démarrage boucle de polling API (toutes les 4s ± jitter)...")
     _api_sem = asyncio.Semaphore(1)  # 1 seul appel API simultané max
+    BASE_INTERVAL  = 4.0   # secondes entre chaque appel
+    JITTER_RANGE   = 1.0   # ± cette valeur (ex: 3.0s – 5.0s)
+    MAX_BACKOFF    = 60.0  # backoff max en secondes après de nombreux échecs
 
     while True:
         try:
             async with _api_sem:
                 results = await asyncio.wait_for(
                     get_latest_results(),
-                    timeout=30  # 30s max pour aiohttp async
+                    timeout=35  # 35s max (légèrement supérieur au timeout interne api_utils)
                 )
 
             if results:
                 last_api_success_time = datetime.now()
-                api_silence_alerted = False  # réinitialiser l'alerte si l'API répond
+                api_silence_alerted = False
                 for result in results:
-                    game_number = result['game_number']
+                    game_number  = result['game_number']
                     player_cards = result.get('player_cards', [])
 
                     if not player_cards:
@@ -5587,7 +5679,7 @@ async def api_polling_loop():
 
                 # ── Nettoyage du cache live : conserver au max 200 entrées ──
                 if len(game_result_cache) > 200:
-                    cutoff = sorted(game_result_cache.keys())[:-150]  # garder les 150 plus récents
+                    cutoff = sorted(game_result_cache.keys())[:-150]
                     for k in cutoff:
                         game_result_cache.pop(k, None)
 
@@ -5602,7 +5694,20 @@ async def api_polling_loop():
         except Exception as e:
             logger.error(f"❌ Erreur polling API: {e}")
 
-        await asyncio.sleep(4)
+        # ── Calcul de l'intervalle avec jitter et backoff exponentiel ────────
+        import api_utils as _au
+        fails = getattr(_au, 'consecutive_failures', 0)
+        if fails >= 3:
+            # Backoff exponentiel plafonné : 4 * 2^(fails-3) avec max 60s
+            backoff = min(BASE_INTERVAL * (2 ** (fails - 3)), MAX_BACKOFF)
+            sleep_t = backoff + random.uniform(0, JITTER_RANGE)
+            if fails == 3:
+                logger.warning(f"⚠️ API: {fails} échecs consécutifs — backoff {backoff:.1f}s")
+        else:
+            # Intervalle normal avec jitter ±1s (entre 3.0 et 5.0s)
+            sleep_t = BASE_INTERVAL + random.uniform(-JITTER_RANGE, JITTER_RANGE)
+
+        await asyncio.sleep(max(3.0, sleep_t))
 
 # ============================================================================
 # RESET ET NETTOYAGE
@@ -5740,8 +5845,8 @@ async def auto_watchdog_task():
                     api_silence_alerted = True
                     actions.append(
                         f"⚠️ API 1xBet silencieuse depuis {int(silence_min)} min\n"
-                        f"Cause probable : IP du serveur bloquée par 1xBet.\n"
-                        f"Le bot fonctionne mais ne reçoit plus de données de jeu."
+                        "Cause probable : IP du serveur bloquée par 1xBet.\n"
+                        "Le bot fonctionne mais ne reçoit plus de données de jeu."
                     )
                     logger.error(f"❌ Watchdog: API 1xBet muette depuis {int(silence_min)} min")
 
@@ -5849,12 +5954,12 @@ async def perform_full_reset(reason: str):
         try:
             admin_entity = await client.get_entity(ADMIN_ID)
             msg = (
-                f"🔄 **RESET SYSTÈME**\n\n"
+                "🔄 **RESET SYSTÈME**\n\n"
                 f"{reason}\n\n"
                 f"✅ {stats} prédictions actives effacées\n"
                 f"✅ {queue_stats} prédictions en file effacées\n"
-                f"✅ Compteurs remis à zéro\n\n"
-                f"🤖 Baccarat AI"
+                "✅ Compteurs remis à zéro\n\n"
+                "🤖 Baccarat AI"
             )
             await client.send_message(admin_entity, msg, parse_mode='markdown')
         except Exception as e:
@@ -5881,14 +5986,14 @@ async def cmd_heures(event):
             now = datetime.now()
             allowed = "✅ OUI" if is_prediction_time_allowed() else "❌ NON"
             await event.respond(
-                f"⏰ **RESTRICTION HORAIRE**\n\n"
+                "⏰ **RESTRICTION HORAIRE**\n\n"
                 f"Heure actuelle: **{now.strftime('%H:%M')}**\n"
                 f"Prédictions autorisées: {allowed}\n\n"
                 f"**Plages actives:**\n{format_hours_config()}\n\n"
-                f"**Usage:**\n"
-                f"`/heures add HH-HH` — Ajouter une plage\n"
-                f"`/heures del HH-HH` — Supprimer une plage\n"
-                f"`/heures clear` — Supprimer toutes les plages (24h/24)"
+                "**Usage:**\n"
+                "`/heures add HH-HH` — Ajouter une plage\n"
+                "`/heures del HH-HH` — Supprimer une plage\n"
+                "`/heures clear` — Supprimer toutes les plages (24h/24)"
             )
             return
 
@@ -6025,7 +6130,7 @@ async def cmd_compteur4(event):
                 )
             lines.append("_(5 dernières — /compteur4 pdf pour le tableau complet)_")
 
-        lines.append(f"\nUsage: `/compteur4` `pdf` `seuil N` `reset`")
+        lines.append("\nUsage: `/compteur4` `pdf` `seuil N` `reset`")
         await event.respond("\n".join(lines), parse_mode='markdown')
 
     except Exception as e:
@@ -6086,7 +6191,7 @@ async def cmd_compteur5(event):
         lines.append(f"\n**Événements enregistrés:** {len(compteur5_events)}")
 
         if compteur5_events:
-            lines.append(f"\n**Derniers enregistrements :**")
+            lines.append("\n**Derniers enregistrements :**")
             for ev in compteur5_events[-5:][::-1]:
                 emoji = suit_emoji_map.get(ev['suit'], ev['suit'])
                 dt    = ev['datetime']
@@ -6096,9 +6201,9 @@ async def cmd_compteur5(event):
                 )
 
         lines.append(
-            f"\n**Usage:**\n`/compteur5 pdf` — Envoyer le PDF\n"
+            "\n**Usage:**\n`/compteur5 pdf` — Envoyer le PDF\n"
             f"`/compteur5 seuil N` — Changer le seuil (actuel: {COMPTEUR5_THRESHOLD})\n"
-            f"`/compteur5 reset` — Réinitialiser"
+            "`/compteur5 reset` — Réinitialiser"
         )
         await event.respond("\n".join(lines))
 
@@ -6178,7 +6283,6 @@ async def cmd_compteur7(event):
         lines.append(f"\n**Séries terminées enregistrées :** {total}")
         if total > 0:
             for s in compteur7_completed[-5:]:
-                sn       = suit_names.get(s['suit'], s['suit'])
                 end_date = s['end_time'].strftime('%d/%m %Hh%M')
                 lines.append(
                     f"  • {end_date} — {s['suit']} **{s['count']}x** "
@@ -6186,7 +6290,7 @@ async def cmd_compteur7(event):
                 )
             lines.append("_(5 dernières — /compteur7 pdf pour le tableau complet)_")
 
-        lines.append(f"\nUsage: `/compteur7` `pdf` `seuil N` `reset`")
+        lines.append("\nUsage: `/compteur7` `pdf` `seuil N` `reset`")
         await event.respond("\n".join(lines), parse_mode='markdown')
 
     except Exception as e:
@@ -6225,7 +6329,7 @@ async def cmd_compteur8(event):
         # Affichage statut
         suit_names = {'♠': 'Pique', '♥': 'Cœur', '♦': 'Carreau', '♣': 'Trèfle'}
         lines = [
-            f"📊 **COMPTEUR8** — Absences consécutives\n"
+            "📊 **COMPTEUR8** — Absences consécutives\n"
             f"_Série enregistrée quand streak d'absence ≥{COMPTEUR8_THRESHOLD}x se TERMINE_\n"
             f"_Miroir du Compteur7 (qui compte les présences ≥{COMPTEUR7_THRESHOLD}x)_\n"
             f"🔴 **Seuil prédiction C8 :** {COMPTEUR8_PRED_SEUIL}x absences → C8 prédit le manque\n"
@@ -6252,7 +6356,6 @@ async def cmd_compteur8(event):
         lines.append(f"\n**Séries d'absences ≥{COMPTEUR8_THRESHOLD} terminées :** {total}")
         if total > 0:
             for s in compteur8_completed[-5:]:
-                sn       = suit_names.get(s['suit'], s['suit'])
                 end_date = s['end_time'].strftime('%d/%m %Hh%M')
                 lines.append(
                     f"  • {end_date} — {s['suit']} **{s['count']}x absents** "
@@ -6260,7 +6363,7 @@ async def cmd_compteur8(event):
                 )
             lines.append("_(5 dernières — /compteur8 pdf pour le tableau complet)_")
 
-        lines.append(f"\nUsage: `/compteur8` `pdf` `reset`")
+        lines.append("\nUsage: `/compteur8` `pdf` `reset`")
         await event.respond("\n".join(lines), parse_mode='markdown')
 
     except Exception as e:
@@ -6395,7 +6498,7 @@ async def cmd_comparaison(event):
         current_h = datetime.now().hour
         now_str   = datetime.now().strftime('%d/%m/%Y à %Hh%M')
         lines = [
-            f"📊 **ANALYSE COMPARAISON INTELLIGENTE**",
+            "📊 **ANALYSE COMPARAISON INTELLIGENTE**",
             f"📅 {now_str} — {total_games} parties analysées",
             f"⏰ {len(active_hours)} tranches horaires actives\n",
         ]
@@ -6425,7 +6528,7 @@ async def cmd_comparaison(event):
             best_strong_grp = max(strong_groups, key=len) if strong_groups else None
             best_weak_grp   = max(weak_groups,   key=len) if weak_groups   else None
 
-            lines.append(f"━━━━━━━━━━━━━━━")
+            lines.append("━━━━━━━━━━━━━━━")
             lines.append(f"{emoji} **{name}** — moyenne globale : **{avg:.0f}%**")
 
             # Message principal en langage naturel
@@ -6495,7 +6598,7 @@ async def cmd_comparaison(event):
                 )
 
         # ── Situation en temps réel ───────────────────────────────────────────
-        lines.append(f"\n━━━━━━━━━━━━━━━")
+        lines.append("\n━━━━━━━━━━━━━━━")
         lines.append(f"🕐 **Situation MAINTENANT ({current_h:02d}h)**")
         if current_h in active_hours:
             ranked = sorted(ALL_SUITS, key=lambda s: taux[s].get(current_h, 0), reverse=True)
@@ -6532,8 +6635,8 @@ async def cmd_comparaison(event):
             lines.append(f"  ℹ️ Pas encore assez de données pour {current_h:02d}h")
 
         # ── Conseils globaux du jour ──────────────────────────────────────────
-        lines.append(f"\n━━━━━━━━━━━━━━━")
-        lines.append(f"💡 **CONSEILS STRATÉGIQUES DU JOUR**")
+        lines.append("\n━━━━━━━━━━━━━━━")
+        lines.append("💡 **CONSEILS STRATÉGIQUES DU JOUR**")
         for suit in suit_order:
             name  = suit_names[suit]
             emoji = suit_emoji[suit]
@@ -6553,7 +6656,7 @@ async def cmd_comparaison(event):
             elif delta >= 10:
                 conseil = f"Variation modérée — meilleur créneau **{top_h:02d}h** ({top_t:.0f}%)"
             else:
-                conseil = f"Comportement stable — peut être joué à tout moment"
+                conseil = "Comportement stable — peut être joué à tout moment"
 
             lines.append(f"  {emoji} **{name}** : {conseil}")
 
@@ -6577,11 +6680,11 @@ async def cmd_df(event):
         parts = event.message.message.split()
         if len(parts) == 1:
             await event.respond(
-                f"⏭️ **PARAMÈTRE DF**\n\n"
+                "⏭️ **PARAMÈTRE DF**\n\n"
                 f"Valeur actuelle : **{PREDICTION_DF}**\n\n"
-                f"**Usage :** `/df [1-10]`\n\n"
-                f"_Quand le jeu N se termine, le bot prédit le jeu N+df._\n"
-                f"_df=1 (défaut) = prédit le jeu suivant immédiatement._"
+                "**Usage :** `/df [1-10]`\n\n"
+                "_Quand le jeu N se termine, le bot prédit le jeu N+df._\n"
+                "_df=1 (défaut) = prédit le jeu suivant immédiatement._"
             )
             return
         val = int(parts[1])
@@ -6684,7 +6787,7 @@ async def cmd_compteur2(event):
         parts = event.message.message.split()
         if len(parts) == 1:
             status_str = "✅ ON" if compteur2_active else "❌ OFF"
-            lines = [f"📊 **COMPTEUR2** (Absences joueur)", f"Statut: {status_str} | Seuil B défaut: {compteur2_seuil_B}", "", "Progression (B dynamique par costume):"]
+            lines = ["📊 **COMPTEUR2** (Absences joueur)", f"Statut: {status_str} | Seuil B défaut: {compteur2_seuil_B}", "", "Progression (B dynamique par costume):"]
             for suit in ALL_SUITS:
                 tracker = compteur2_trackers.get(suit)
                 if tracker:
@@ -6694,7 +6797,7 @@ async def cmd_compteur2(event):
                     status = "🔮 PRÊT" if tracker.counter >= b else f"{tracker.counter}/{b}"
                     b_marker = f" (B={b})" if b != compteur2_seuil_B else ""
                     lines.append(f"{tracker.get_display_name()}: {bar} {status}{b_marker}")
-            lines.append(f"\n**Usage:** `/compteur2 [B/on/off/reset]`")
+            lines.append("\n**Usage:** `/compteur2 [B/on/off/reset]`")
             await event.respond("\n".join(lines))
             return
 
@@ -6753,9 +6856,9 @@ async def cmd_compteur13(event):
         if len(parts) == 1:
             status = "✅ ON" if compteur13_active else "❌ OFF"
             lines = [
-                f"🎯 **COMPTEUR 13** — Consécutifs + Miroir C2",
+                "🎯 **COMPTEUR 13** — Consécutifs + Miroir C2",
                 f"Statut: {status} | Seuil wx: **{COMPTEUR13_THRESHOLD}**",
-                f"Paires miroir: ♦️↔❤️ | ♣️↔♠️",
+                "Paires miroir: ♦️↔❤️ | ♣️↔♠️",
                 "",
                 "**Progression par costume (consécutifs en cours) :**",
             ]
@@ -6767,7 +6870,7 @@ async def cmd_compteur13(event):
                 miroir_disp = SUIT_DISPLAY.get(miroir, miroir)
                 state    = "🔮 PRÊT" if cnt >= COMPTEUR13_THRESHOLD else f"{cnt}/{COMPTEUR13_THRESHOLD}"
                 lines.append(f"  {SUIT_DISPLAY.get(suit, suit)}: {bar} {state} → miroir: {miroir_disp}")
-            lines.append(f"\n**Usage:** `/compteur13 [wx N / on / off / reset]`")
+            lines.append("\n**Usage:** `/compteur13 [wx N / on / off / reset]`")
             await event.respond("\n".join(lines), parse_mode='markdown')
             return
 
@@ -6848,7 +6951,7 @@ async def cmd_compteur14(event):
         progress_pct = compteur14_cycle_games / COMPTEUR14_CYCLE_SIZE * 100
 
         lines = [
-            f"📊 **COMPTEUR 14 — Fréquence absolue des costumes**\n"
+            "📊 **COMPTEUR 14 — Fréquence absolue des costumes**\n"
             f"Cycle : **{compteur14_cycle_games}/{COMPTEUR14_CYCLE_SIZE} jeux** ({progress_pct:.1f}%)\n"
             f"Début du cycle : jeu #{compteur14_cycle_start}\n"
         ]
@@ -6863,7 +6966,7 @@ async def cmd_compteur14(event):
 
         lines.append(f"\n**Total apparitions :** {total_appear}")
         lines.append(f"\n**Rapport automatique** à {COMPTEUR14_CYCLE_SIZE} jeux → reset automatique")
-        lines.append(f"\n**Usage :** `/compteur14` · `/compteur14 rapport` · `/compteur14 reset`")
+        lines.append("\n**Usage :** `/compteur14` · `/compteur14 rapport` · `/compteur14 reset`")
 
         await event.respond("\n".join(lines), parse_mode='markdown')
     except Exception as e:
@@ -6923,9 +7026,9 @@ async def cmd_canaux(event):
                 st = f"✅ `{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "❌ Inactif"
                 await event.respond(
                     f"📡 **Canal 3 (prédictions + résultats):** {st}\n\n"
-                    f"Usage: `/canaux canal3 [ID|off]`\n"
-                    f"Le bot doit être **admin** dans ce canal.\n"
-                    f"Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
+                    "Usage: `/canaux canal3 [ID|off]`\n"
+                    "Le bot doit être **admin** dans ce canal.\n"
+                    "Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
                 )
                 return
             arg = parts[2].lower()
@@ -6940,7 +7043,7 @@ async def cmd_canaux(event):
                 old = PREDICTION_CHANNEL_ID3; PREDICTION_CHANNEL_ID3 = new_id
                 await event.respond(
                     f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
-                    f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                    "Toutes les prédictions + résultats seront redirigés vers ce canal."
                 )
             db.db_schedule(save_runtime_config())
             return
@@ -6950,9 +7053,9 @@ async def cmd_canaux(event):
                 st = f"✅ `{PREDICTION_CHANNEL_ID4}`" if PREDICTION_CHANNEL_ID4 else "❌ Inactif"
                 await event.respond(
                     f"📡 **Canal 4 (prédictions + résultats):** {st}\n\n"
-                    f"Usage: `/canaux canal4 [ID|off]`\n"
-                    f"Le bot doit être **admin** dans ce canal.\n"
-                    f"Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
+                    "Usage: `/canaux canal4 [ID|off]`\n"
+                    "Le bot doit être **admin** dans ce canal.\n"
+                    "Reçoit : prédictions initiales + résultats (gagné/perdu/expiré)."
                 )
                 return
             arg = parts[2].lower()
@@ -6967,7 +7070,7 @@ async def cmd_canaux(event):
                 old = PREDICTION_CHANNEL_ID4; PREDICTION_CHANNEL_ID4 = new_id
                 await event.respond(
                     f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
-                    f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                    "Toutes les prédictions + résultats seront redirigés vers ce canal."
                 )
             db.db_schedule(save_runtime_config())
             return
@@ -7097,7 +7200,7 @@ async def cmd_status(event):
         "",
         f"**Plages horaires:**\n{format_hours_config()}",
         "",
-        f"**Compteur4 (absences):**",
+        "**Compteur4 (absences):**",
     ]
 
     for suit in ALL_SUITS:
@@ -7126,52 +7229,52 @@ async def cmd_help(event):
         return
 
     help_text = (
-        f"📖 **BACCARAT AI — AIDE**\n\n"
-        f"💡 **Recommandé : utilisez `/menu` pour accéder à tout via des boutons cliquables.**\n\n"
-        f"**⚙️ Configuration:**\n"
+        "📖 **BACCARAT AI — AIDE**\n\n"
+        "💡 **Recommandé : utilisez `/menu` pour accéder à tout via des boutons cliquables.**\n\n"
+        "**⚙️ Configuration:**\n"
         f"`/df [1-10]` — Décalage prédiction (actuel: df={PREDICTION_DF})\n"
         f"`/gap [2-10]` — Écart min entre prédictions ({MIN_GAP_BETWEEN_PREDICTIONS})\n\n"
-        f"**⏰ Restriction horaire:**\n"
-        f"`/heures` — Voir/gérer les plages (add/del/clear)\n\n"
-        f"**📊 Compteurs:**\n"
-        f"`/compteur2 [B/on/off/reset]` — Absences consécutives (prédictions)\n"
-        f"`/stats` — Séries Compteur1 (présences joueur)\n"
+        "**⏰ Restriction horaire:**\n"
+        "`/heures` — Voir/gérer les plages (add/del/clear)\n\n"
+        "**📊 Compteurs:**\n"
+        "`/compteur2 [B/on/off/reset]` — Absences consécutives (prédictions)\n"
+        "`/stats` — Séries Compteur1 (présences joueur)\n"
         f"`/compteur4 [pdf/seuil N]` — Absences longues (seuil: {COMPTEUR4_THRESHOLD})\n"
-        f"`/compteur5` — Patterns par costume\n"
+        "`/compteur5` — Patterns par costume\n"
         f"`/compteur7 [pdf/seuil N/reset]` — Présences ≥{COMPTEUR7_THRESHOLD} consécutives\n"
         f"`/compteur8 [pdf/reset]` — Absences ≥{COMPTEUR8_THRESHOLD} (miroir C7)\n"
         f"`/compteur13 [wx N/on/off/reset]` — Consécutifs + miroir C2 (seuil: {COMPTEUR13_THRESHOLD})\n\n"
-        f"**📡 Canaux:**\n"
-        f"`/canaux` — Voir config des canaux\n"
-        f"`/canaux canal3 [ID|off]` — Canal redirect (prédictions + résultats)\n"
-        f"`/canaux canal4 [ID|off]` — Canal redirect (prédictions + résultats)\n"
-        f"`/canaux distribution [ID|off]` — Canal secondaire\n"
-        f"`/canaux compteur2 [ID|off]` — Canal Compteur2\n\n"
-        f"**📋 Gestion prédictions:**\n"
-        f"`/raison` — 15 dernières prédictions + raison détaillée\n"
-        f"`/raison N` — Raison pour le jeu #N\n"
-        f"`/raison pdf` — PDF complet de toutes les prédictions\n"
-        f"`/raison2` — Top 10 meilleures combinaisons (miroir × wx × B)\n"
-        f"`/raison2 pdf` — PDF complet de la simulation (216 combinaisons)\n"
-        f"`/raison2 P1` `/raison2 P2` `/raison2 P3` — Tableau détaillé par miroir\n"
-        f"`/raison2 tout` — Toutes les 216 combinaisons triées\n"
-        f"`/pending` — Prédictions en vérification\n"
-        f"`/queue` — File d'attente\n"
-        f"`/status` — Statut complet\n"
-        f"`/reset` — Reset manuel\n"
-        f"`/debloquer` — Déblocage d'urgence\n\n"
-        f"**📈 Analyse:**\n"
-        f"`/perdus` — PDF des pertes\n"
-        f"`/favorables [on/off/canal]` — Heures favorables (auto 3h)\n"
-        f"`/comparaison` — Distribution costumes par heure\n\n"
-        f"**📊 Bilans:**\n"
-        f"`/bilan` — Bilan actuel (auto: 00h,04h,08h,12h,16h,20h)\n"
-        f"`/bilan now` — Envoyer le bilan maintenant\n"
-        f"`/b` — Seuils B par costume\n\n"
-        f"**🧠 Analyse IA:**\n"
-        f"`/strategie` — Évaluation stratégie + toutes les combinaisons miroir/inverse\n"
-        f"`Oui N` — Appliquer la combinaison numéro N proposée\n\n"
-        f"🤖 Baccarat AI | Source: 1xBet API"
+        "**📡 Canaux:**\n"
+        "`/canaux` — Voir config des canaux\n"
+        "`/canaux canal3 [ID|off]` — Canal redirect (prédictions + résultats)\n"
+        "`/canaux canal4 [ID|off]` — Canal redirect (prédictions + résultats)\n"
+        "`/canaux distribution [ID|off]` — Canal secondaire\n"
+        "`/canaux compteur2 [ID|off]` — Canal Compteur2\n\n"
+        "**📋 Gestion prédictions:**\n"
+        "`/raison` — 15 dernières prédictions + raison détaillée\n"
+        "`/raison N` — Raison pour le jeu #N\n"
+        "`/raison pdf` — PDF complet de toutes les prédictions\n"
+        "`/raison2` — Top 10 meilleures combinaisons (miroir × wx × B)\n"
+        "`/raison2 pdf` — PDF complet de la simulation (216 combinaisons)\n"
+        "`/raison2 P1` `/raison2 P2` `/raison2 P3` — Tableau détaillé par miroir\n"
+        "`/raison2 tout` — Toutes les 216 combinaisons triées\n"
+        "`/pending` — Prédictions en vérification\n"
+        "`/queue` — File d'attente\n"
+        "`/status` — Statut complet\n"
+        "`/reset` — Reset manuel\n"
+        "`/debloquer` — Déblocage d'urgence\n\n"
+        "**📈 Analyse:**\n"
+        "`/perdus` — PDF des pertes\n"
+        "`/favorables [on/off/canal]` — Heures favorables (auto 3h)\n"
+        "`/comparaison` — Distribution costumes par heure\n\n"
+        "**📊 Bilans:**\n"
+        "`/bilan` — Bilan actuel (auto: 00h,04h,08h,12h,16h,20h)\n"
+        "`/bilan now` — Envoyer le bilan maintenant\n"
+        "`/b` — Seuils B par costume\n\n"
+        "**🧠 Analyse IA:**\n"
+        "`/strategie` — Évaluation stratégie + toutes les combinaisons miroir/inverse\n"
+        "`Oui N` — Appliquer la combinaison numéro N proposée\n\n"
+        "🤖 Baccarat AI | Source: 1xBet API"
     )
     await event.respond(help_text, buttons=[[Button.inline("🤖 Ouvrir le Menu", b"mn")]])
 
@@ -7192,9 +7295,9 @@ async def cmd_strategie(event):
 
     resolved = [p for p in prediction_history
                 if p.get('status') not in ('en_cours', 'sending', None)]
-    if len(resolved) < 3:
+    if len(resolved) < 1:
         await event.respond(
-            "📊 Pas assez de prédictions finalisées (minimum 3) pour analyser."
+            "📊 Aucune prédiction finalisée disponible pour analyser."
         )
         return
 
@@ -7460,7 +7563,7 @@ async def cmd_strategie(event):
                 pred_lists[(c['num'], wx, df_sim)] = preds_wx
 
     # ── Trouver la meilleure combinaison globale ─────────────────────────────
-    valid_entries = {k: v for k, v in sim_matrix.items() if v['total'] >= 3}
+    valid_entries = {k: v for k, v in sim_matrix.items() if v['total'] >= 1}
     best_combo_key = None
     best_combo_val = None
     if valid_entries:
@@ -7514,7 +7617,7 @@ async def cmd_strategie(event):
     )
     lines.append("🔄 **COMBINAISONS MIROIR — TRACKERS INDÉPENDANTS**")
     lines.append(
-        f"_(3 miroirs × wx3-8 × B3-8 × trigger+1/+2 = 216 compteurs C13+C2 propres · "
+        "_(3 miroirs × wx3-8 × B3-8 × trigger+1/+2 = 216 compteurs C13+C2 propres · "
         f"B_actif={compteur2_seuil_B})_"
     )
     lines.append("")
@@ -7740,7 +7843,7 @@ async def cmd_oui(event):
         )
 
         lines = [
-            f"🏆 **Meilleure stratégie appliquée avec succès !**",
+            "🏆 **Meilleure stratégie appliquée avec succès !**",
             f"**{best_auto['name']}** · trigger+{new_df_sim}",
             "",
         ] + changes_applied + [
@@ -8040,7 +8143,7 @@ def generate_raison2_pdf(sim: dict) -> bytes:
 
     # Colonnes (paysage A4 = 277mm, marges 16 → 261 mm utiles)
     cw = [8, 36, 34, 14, 14, 14, 20, 20, 22, 18, 20, 20]
-    headers = ['#', 'Miroir', 'Paires', 'wx', 'B', 'df', 'Gagnes', 'Perdus',
+    headers = ['#', 'Miroir', 'Paires', 'wx', 'B', 'd', 'Gagnes', 'Perdus',
                'Score', 'C2 wins', 'Total pred.', 'Score/Total']
 
     pdf.set_font('Helvetica', 'B', 8)
@@ -8421,7 +8524,7 @@ def generate_raison_pdf() -> bytes:
     pdf.set_font('Helvetica', 'I', 8)
     pdf.set_text_color(*GREY_TXT)
     pdf.cell(0, 5,
-        f'BACCARAT AI  -  Rapport raisons  -  '
+        'BACCARAT AI  -  Rapport raisons  -  '
         f'{datetime.now().strftime("%d/%m/%Y %H:%M")}', new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
 
     return bytes(pdf.output())
@@ -8491,7 +8594,7 @@ async def cmd_raison(event):
             await client.send_file(
                 admin_entity, buf,
                 caption=(
-                    f"📖 **RAPPORT PRÉDICTIONS**\n\n"
+                    "📖 **RAPPORT PRÉDICTIONS**\n\n"
                     f"📊 {len(prediction_history)} prédictions\n"
                     f"✅ {wins} gagnées  |  ❌ {losses} perdues\n"
                     f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M')}"
@@ -8524,7 +8627,7 @@ async def cmd_raison(event):
     if not recent:
         await event.respond("❌ Aucune prediction dans l'historique.")
         return
-    lines = [f"📖 **RAISONS DES 15 DERNIERES PREDICTIONS**\n"]
+    lines = ["📖 **RAISONS DES 15 DERNIERES PREDICTIONS**\n"]
     for i, pred in enumerate(recent, 1):
         lines.append(format_pred_block(pred, index=i))
         lines.append("")
@@ -8560,7 +8663,7 @@ async def cmd_raison2(event):
     cur_mirror = dict(COMPTEUR13_MIRROR)
 
     # ── Toujours lire best_key / best_val depuis silent_combo_states ──────────
-    _valid = {k: v for k, v in silent_combo_states.items() if v.get('total', 0) >= 3}
+    _valid = {k: v for k, v in silent_combo_states.items() if v.get('total', 0) >= 1}
     if _valid:
         best_key, _bv = max(_valid.items(), key=lambda x: (x[1]['wins'] - x[1]['losses'], x[1]['wins']))
         best_val = {**_bv, 'score': _bv['wins'] - _bv['losses']}
@@ -8597,7 +8700,7 @@ async def cmd_raison2(event):
     if best_key and len(best_key) == 4:
         bm, bwx, bb, bdf = best_key
         lines.append(
-            f"🏆 **MEILLEURE CONFIGURATION GLOBALE :**"
+            "🏆 **MEILLEURE CONFIGURATION GLOBALE :**"
         )
         lines.append(
             f"   {_COMBO_NAMES.get(bm,'?')} | wx={bwx} | B={bb} | df+{bdf}"
@@ -8633,7 +8736,7 @@ async def cmd_raison2(event):
                         'score':  state['wins'] - state['losses'],
                     }
             # Best key depuis trackers
-            _valid_pdf = {k: v for k, v in tracker_sim_matrix.items() if v['total'] >= 3}
+            _valid_pdf = {k: v for k, v in tracker_sim_matrix.items() if v['total'] >= 1}
             pdf_best_key, pdf_best_val = (None, None)
             if _valid_pdf:
                 pdf_best_key, pdf_best_val = max(_valid_pdf.items(), key=lambda x: (x[1]['score'], x[1]['wins']))
@@ -8764,7 +8867,7 @@ async def cmd_raison2(event):
     # ── Mode TOUT : 3 messages (un par miroir), toutes les 216 combinaisons ──
     if sub == 'TOUT':
         # En-tête global déjà dans lines
-        lines.append(f"📤 **TOUTES LES 216 COMBINAISONS** — envoi en 3 messages (P1 / P2 / P3)")
+        lines.append("📤 **TOUTES LES 216 COMBINAISONS** — envoi en 3 messages (P1 / P2 / P3)")
         lines.append("_Chaque message = 1 miroir × 6 wx × 6 B × 2 df = 72 combos_")
         lines.append("")
         if rec_num:
@@ -8784,11 +8887,11 @@ async def cmd_raison2(event):
             reco_tag = " ⭐ RECOMMANDÉ" if is_reco else ""
 
             msg_lines = [
-                f"╔══════════════════════════════╗",
+                "╔══════════════════════════════╗",
                 f"║  🔬 {cname_t}{act_tag}{reco_tag}",
-                f"╚══════════════════════════════╝",
+                "╚══════════════════════════════╝",
                 f"Miroir : {cdisp_t}",
-                f"─────────── trigger+1 ───────────",
+                "─────────── trigger+1 ───────────",
             ]
 
             for wx in range(3, 9):
@@ -8817,7 +8920,7 @@ async def cmd_raison2(event):
                             + " ".join(preds_disp)
                         )
 
-            msg_lines.append(f"─────────── trigger+2 ───────────")
+            msg_lines.append("─────────── trigger+2 ───────────")
 
             for wx in range(3, 9):
                 for b in range(3, 9):
@@ -8865,7 +8968,7 @@ async def cmd_raison2(event):
     _tracker_active2      = sum(1 for v in silent_combo_states.values() if v.get('total', 0) > 0)
 
     lines.append(f"🏅 **TOP 10 — TRACKERS SILENCIEUX** _(sur {_tracker_active2}/216 combos actifs · {_tracker_total_preds2} prédictions cumulées)_")
-    lines.append(f"_Tape `/raison2 tout` pour les 216 | `/raison2 P1` `/raison2 P2` `/raison2 P3` pour le détail_")
+    lines.append("_Tape `/raison2 tout` pour les 216 | `/raison2 P1` `/raison2 P2` `/raison2 P3` pour le détail_")
     lines.append("")
 
     if not sorted_entries:
@@ -8942,13 +9045,13 @@ async def cmd_bilan(event):
             if bilan_interval_hours > 0 else "🔕 Désactivé"
         )
         await event.respond(
-            f"📊 **BILAN AUTOMATIQUE**\n\n"
+            "📊 **BILAN AUTOMATIQUE**\n\n"
             f"Statut: **{status}**\n"
-            f"Fréquence: **toutes les 4h pile** (00h, 04h, 08h, 12h, 16h, 20h)\n\n"
-            f"**Usage:**\n"
-            f"`/bilan now` — Envoyer le bilan immédiatement dans votre chat privé\n"
-            f"`/bilan 0` — Désactiver l'envoi automatique\n"
-            f"`/bilan on` — Réactiver l'envoi automatique\n\n"
+            "Fréquence: **toutes les 4h pile** (00h, 04h, 08h, 12h, 16h, 20h)\n\n"
+            "**Usage:**\n"
+            "`/bilan now` — Envoyer le bilan immédiatement dans votre chat privé\n"
+            "`/bilan 0` — Désactiver l'envoi automatique\n"
+            "`/bilan on` — Réactiver l'envoi automatique\n\n"
             + get_bilan_text(),
             parse_mode='markdown'
         )
@@ -9019,9 +9122,9 @@ async def cmd_historique_strategies(event):
 
     dec_icons = {'confirmée': '✅', 'ignorée': '❌', 'en_attente': '⏳'}
     lines = [
-        f"╔══════════════════════════════════╗",
+        "╔══════════════════════════════════╗",
         f"║  📋 HISTORIQUE STRATÉGIES — {limit} dernières  ║",
-        f"╚══════════════════════════════════╝",
+        "╚══════════════════════════════════╝",
         "",
     ]
     for i, e in enumerate(entries, 1):
@@ -9046,12 +9149,142 @@ async def cmd_historique_strategies(event):
 # COMMANDE /formation — BACKTEST FORMATION DE MISE APRÈS PERTE
 # ============================================================================
 
+def _compute_formation_stats(resolved: list) -> dict:
+    """
+    Calcule les statistiques de formation sur les prédictions résolues.
+    Pour chaque perte au jeu G (numéro prédit), teste si le 1er, 2ème ou 3ème
+    costume apparu au jeu G se retrouve au jeu G+1.
+    Retourne un dict avec f1/f2/f3 : (ok, total, rate) et best ("f1","f2","f3",None).
+    """
+    perdues = [p for p in resolved if p.get('status') == 'perdu']
+
+    f1_ok = f1_total = 0
+    f2_ok = f2_total = 0
+    f3_ok = f3_total = 0
+
+    for pred in perdues:
+        G = pred['predicted_game']
+        cache_G  = game_result_cache.get(G, {})
+        cache_G1 = game_result_cache.get(G + 1, {})
+        cards_G  = cache_G.get('player_cards', [])
+        suits_G1 = cache_G1.get('player_suits', set())
+
+        if not cards_G or not suits_G1:
+            continue
+
+        cards_appeared = [
+            normalize_suit(c.get('S', '')) for c in cards_G
+            if normalize_suit(c.get('S', '')) in ALL_SUITS
+        ]
+
+        f1s = cards_appeared[0] if len(cards_appeared) > 0 else None
+        f2s = cards_appeared[1] if len(cards_appeared) > 1 else None
+        f3s = cards_appeared[2] if len(cards_appeared) > 2 else None
+
+        if f1s:
+            f1_total += 1
+            if f1s in suits_G1:
+                f1_ok += 1
+        if f2s:
+            f2_total += 1
+            if f2s in suits_G1:
+                f2_ok += 1
+        if f3s:
+            f3_total += 1
+            if f3s in suits_G1:
+                f3_ok += 1
+
+    f1_rate = round(f1_ok / f1_total * 100) if f1_total > 0 else 0
+    f2_rate = round(f2_ok / f2_total * 100) if f2_total > 0 else 0
+    f3_rate = round(f3_ok / f3_total * 100) if f3_total > 0 else 0
+
+    rates = [(f1_rate, f1_total, 'f1'), (f2_rate, f2_total, 'f2'), (f3_rate, f3_total, 'f3')]
+    eligible = [(r, t, k) for r, t, k in rates if t > 0]
+    best = max(eligible, key=lambda x: x[0])[2] if eligible else None
+
+    return {
+        'f1': (f1_ok, f1_total, f1_rate),
+        'f2': (f2_ok, f2_total, f2_rate),
+        'f3': (f3_ok, f3_total, f3_rate),
+        'best': best,
+        'perdues': len(perdues),
+    }
+
+
+async def _trigger_formation_follow_up(original_game: int, original_suit: str, check_game: int, pred_snap: dict):
+    """
+    Appelée dès le premier échec (R0) au jeu prédit.
+    1. Calcule la meilleure formation sur les prédictions résolues.
+    2. Identifie le costume recommandé parmi les cartes du jeu check_game (jeu prédit).
+    3. Ajoute "Formation :[costume]" comme suffixe dans le message d'animation existant.
+    4. Enregistre dans formation_follow_ups[check_game+1] pour vérification au jeu suivant.
+    """
+    global formation_follow_ups
+
+    # ── Cartes apparues au jeu check_game (jeu prédit, R0 raté) ─────────────
+    cache = game_result_cache.get(check_game, {})
+    raw_cards = cache.get('player_cards', [])
+    cards_appeared = [
+        normalize_suit(c.get('S', '')) for c in raw_cards
+        if normalize_suit(c.get('S', '')) in ALL_SUITS
+    ]
+    if not cards_appeared:
+        logger.warning(f"⚠️ Formation #{original_game}: aucune carte trouvée au jeu #{check_game} dans le cache — formation annulée")
+        return
+
+    # ── Meilleure formation sur l'historique résolu ──────────────────────────
+    resolved = [
+        p for p in prediction_history
+        if p.get('status', 'en_cours') != 'en_cours'
+    ][:50]
+
+    rank_labels = {'f1': '1er', 'f2': '2ème', 'f3': '3ème'}
+    if len(resolved) >= 1:
+        stats = _compute_formation_stats(resolved)
+        best  = stats['best'] or 'f1'
+    else:
+        best  = 'f1'
+
+    rank_label = rank_labels.get(best, best)
+
+    # ── Costume recommandé ───────────────────────────────────────────────────
+    idx_map = {'f1': 0, 'f2': 1, 'f3': 2}
+    idx     = idx_map.get(best, 0)
+    if idx >= len(cards_appeared):
+        idx = 0
+    recommended_suit = cards_appeared[idx]
+    rec_disp = SUIT_DISPLAY.get(recommended_suit, recommended_suit)
+
+    # ── Injecter le suffixe dans la prédiction en cours ──────────────────────
+    formation_suffix = (
+        f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{check_game + 1}**\n"
+        "⏳ _Analyse..._"
+    )
+    active_pred = pending_predictions.get(original_game)
+    if active_pred:
+        active_pred['formation_suffix'] = formation_suffix
+        logger.info(f"✅ Formation injectée → prédiction #{original_game} | costume:{rec_disp} | position:{rank_label}")
+    else:
+        logger.warning(f"⚠️ Formation #{original_game}: prédiction absente de pending_predictions — suffixe non injecté")
+
+    # ── Enregistrer le follow-up pour le jeu suivant (rattrapage 0/1/2) ─────
+    next_game = check_game + 1
+    formation_follow_ups[next_game] = {
+        'recommended_suit': recommended_suit,
+        'original_game':    original_game,
+        'original_suit':    original_suit,
+        'rattrapage':       0,          # R0 formation : première vérification
+        'check_game_orig':  check_game, # jeu du R0 raté (pour affichage)
+    }
+    logger.info(f"📊 Formation #{original_game} → {rec_disp} [{rank_label}] (vérif R0 au #{next_game})")
+
+
 async def cmd_formation(event):
     """
     /formation [N]
     Teste la formation de mise sur les N dernières prédictions résolues.
-    Formation : quand le bot perd au jeu G, les cartes apparues à G
-    sont testées au jeu G+1 (est-ce que ces suits reviennent ?).
+    Formation : quand le bot perd au jeu G (numéro prédit), les costumes apparus
+    à ce jeu sont testés au jeu G+1. Compare les 1er, 2ème et 3ème costumes.
     Conseille l'administrateur sur la meilleure formation à suivre.
     """
     if event.is_group or event.is_channel:
@@ -9081,87 +9314,69 @@ async def cmd_formation(event):
     wins_total   = sum(1 for p in resolved if 'gagne' in p.get('status', ''))
     losses_total = sum(1 for p in resolved if p.get('status') == 'perdu')
 
-    # ── Filtrer les pertes pour tester la formation ──
     perdues = [p for p in resolved if p.get('status') == 'perdu']
+    stats   = _compute_formation_stats(resolved)
+    f1_ok, f1_total, f1_rate = stats['f1']
+    f2_ok, f2_total, f2_rate = stats['f2']
+    f3_ok, f3_total, f3_rate = stats['f3']
+    best = stats['best']
 
-    # Formation stats
-    f1_ok = 0   # 1ère carte de G apparaît à G+1
-    f2_ok = 0   # 2ème carte de G apparaît à G+1
-    f1_total = 0
-    f2_total = 0
-
+    # ── Détail des 15 dernières pertes ──
     detail_lines = []
-    for pred in perdues[:15]:  # détail des 15 dernières pertes max
-        G          = pred['predicted_game']
-        suit_pred  = pred['suit']
-        suit_disp  = SUIT_DISPLAY.get(suit_pred, suit_pred)
+    for pred in perdues[:15]:
+        G         = pred['predicted_game']
+        suit_pred = pred['suit']
+        suit_disp = SUIT_DISPLAY.get(suit_pred, suit_pred)
 
-        cache_G    = game_result_cache.get(G, {})
-        cache_G1   = game_result_cache.get(G + 1, {})
-        cards_G    = cache_G.get('player_cards', [])
-        suits_G1   = cache_G1.get('player_suits', set())
+        cache_G  = game_result_cache.get(G, {})
+        cache_G1 = game_result_cache.get(G + 1, {})
+        cards_G  = cache_G.get('player_cards', [])
+        suits_G1 = cache_G1.get('player_suits', set())
 
         if not cards_G or not suits_G1:
             detail_lines.append(
-                f"  ❌ Jeu #{G} : prédit {suit_disp} → PERDU | _données cache manquantes_"
+                f"  ❌ Jeu #{G} : prédit {suit_disp} → PERDU | _cache manquant_"
             )
             continue
 
-        # Cartes apparues au jeu G (ce qui a remplacé le prédit)
         cards_appeared = [
             normalize_suit(c.get('S', '')) for c in cards_G
             if normalize_suit(c.get('S', '')) in ALL_SUITS
         ]
-        appeared_disp = ' '.join(SUIT_DISPLAY.get(s, s) for s in cards_appeared) or '?'
 
-        # Test formation : les costumes de G apparaissent-ils à G+1 ?
-        f1_suit = cards_appeared[0] if len(cards_appeared) > 0 else None
-        f2_suit = cards_appeared[1] if len(cards_appeared) > 1 else None
+        f1s = cards_appeared[0] if len(cards_appeared) > 0 else None
+        f2s = cards_appeared[1] if len(cards_appeared) > 1 else None
+        f3s = cards_appeared[2] if len(cards_appeared) > 2 else None
 
-        f1_in_G1 = f1_suit in suits_G1 if f1_suit else None
-        f2_in_G1 = f2_suit in suits_G1 if f2_suit else None
-
-        if f1_suit:
-            f1_total += 1
-            if f1_in_G1:
-                f1_ok += 1
-        if f2_suit:
-            f2_total += 1
-            if f2_in_G1:
-                f2_ok += 1
-
-        f1_disp = SUIT_DISPLAY.get(f1_suit, '?') if f1_suit else '—'
-        f2_disp = SUIT_DISPLAY.get(f2_suit, '?') if f2_suit else '—'
-        f1_icon = '✅' if f1_in_G1 else ('❌' if f1_in_G1 is False else '—')
-        f2_icon = '✅' if f2_in_G1 else ('❌' if f2_in_G1 is False else '—')
+        f1d = SUIT_DISPLAY.get(f1s, '—') if f1s else '—'
+        f2d = SUIT_DISPLAY.get(f2s, '—') if f2s else '—'
+        f3d = SUIT_DISPLAY.get(f3s, '—') if f3s else '—'
+        f1i = ('✅' if f1s in suits_G1 else '❌') if f1s else '—'
+        f2i = ('✅' if f2s in suits_G1 else '❌') if f2s else '—'
+        f3i = ('✅' if f3s in suits_G1 else '❌') if f3s else '—'
 
         detail_lines.append(
-            f"  📍 Jeu #{G} : prédit {suit_disp} → PERDU\n"
-            f"       Apparu au #{G} : {appeared_disp}\n"
-            f"       1ère carte ({f1_disp}) → jeu #{G+1} : {f1_icon}\n"
-            f"       2ème carte ({f2_disp}) → jeu #{G+1} : {f2_icon}"
+            f"  📍 **Jeu #{G}** prédit : {suit_disp} → ❌ PERDU\n"
+            f"       Costumes apparus au jeu #{G} :\n"
+            f"         1er costume : {f1d} → jeu #{G+1} : {f1i}\n"
+            f"         2ème costume : {f2d} → jeu #{G+1} : {f2i}\n"
+            f"         3ème costume : {f3d} → jeu #{G+1} : {f3i}"
         )
 
-    # ── Statistiques globales de la formation ──
-    f1_rate  = round(f1_ok / f1_total * 100) if f1_total > 0 else 0
-    f2_rate  = round(f2_ok / f2_total * 100) if f2_total > 0 else 0
-
-    if f1_rate >= f2_rate and f1_total > 0:
-        best_formation = (
-            f"Après une perte au jeu N, mise sur la **1ère carte apparue au jeu N** "
-            f"pour le jeu N+1.\n"
-            f"  Taux de réussite : **{f1_rate}%** ({f1_ok}/{f1_total})"
-        )
-        best_icon = "🥇"
-    elif f2_total > 0:
-        best_formation = (
-            f"Après une perte au jeu N, mise sur la **2ème carte apparue au jeu N** "
-            f"pour le jeu N+1.\n"
-            f"  Taux de réussite : **{f2_rate}%** ({f2_ok}/{f2_total})"
-        )
+    # ── Recommandation ──
+    rank_labels = {'f1': '1er costume du numéro prédit',
+                   'f2': '2ème costume du numéro prédit',
+                   'f3': '3ème costume du numéro prédit'}
+    if best:
+        ok_b, tot_b, rate_b = stats[best]
+        label_b = rank_labels[best]
+        rec_lines = [
+            f"✅ Mise sur le **{label_b}**",
+            f"   Taux de réussite : **{rate_b}%** ({ok_b}/{tot_b} pertes testées)",
+        ]
         best_icon = "🥇"
     else:
-        best_formation = "Données insuffisantes pour déterminer la meilleure formation."
+        rec_lines = ["Données insuffisantes pour recommander une formation."]
         best_icon = "⚠️"
 
     # ── Construire le message final ──
@@ -9170,31 +9385,154 @@ async def cmd_formation(event):
         "║   📊 FORMATION DE MISE — BACKTEST  ║",
         "╚═══════════════════════════════════╝",
         "",
-        f"Analyse sur : **{len(resolved)}** prédictions résolues",
+        f"Analyse : **{len(resolved)}** prédictions résolues",
         f"  ✅ Gagnées : **{wins_total}**  |  ❌ Perdues : **{losses_total}**",
         "",
-        "─── Détail des pertes ───",
+        "─── Détail des 15 dernières pertes ───",
     ] + detail_lines + [
         "",
-        "─── Résultats de la formation ───",
-        f"  1ère carte du jeu perdu → jeu suivant : "
-        f"**{f1_ok}/{f1_total}** ✅  ({f1_rate}%)" if f1_total > 0 else "  1ère carte : données insuffisantes",
-        f"  2ème carte du jeu perdu → jeu suivant : "
-        f"**{f2_ok}/{f2_total}** ✅  ({f2_rate}%)" if f2_total > 0 else "  2ème carte : données insuffisantes",
+        "─── Résultats globaux de la formation ───",
+        (f"  1er costume du jeu prédit → jeu suivant : **{f1_ok}/{f1_total}** ✅ ({f1_rate}%)"
+         if f1_total > 0 else "  1er costume : données insuffisantes"),
+        (f"  2ème costume du jeu prédit → jeu suivant : **{f2_ok}/{f2_total}** ✅ ({f2_rate}%)"
+         if f2_total > 0 else "  2ème costume : données insuffisantes"),
+        (f"  3ème costume du jeu prédit → jeu suivant : **{f3_ok}/{f3_total}** ✅ ({f3_rate}%)"
+         if f3_total > 0 else "  3ème costume : données insuffisantes"),
         "",
         f"─── {best_icon} Recommandation ───",
-        best_formation,
+    ] + rec_lines + [
         "",
-        f"💡 **Comment jouer :**",
-        f"Quand le bot annonce PERDU pour le jeu N :",
-        f"  1. Note le **costume de la 1ère carte** révélée au jeu N",
-        f"  2. Au jeu N+1, mise sur ce costume",
-        f"  3. Si ce costume apparaît dans les cartes du jeu N+1 → gagné",
+        "💡 **Comment jouer après un PERDU au jeu N :**",
+        "  1️⃣  Regarde les costumes qui sont apparus au jeu N (le numéro prédit)",
+        "  2️⃣  Prends le costume recommandé dans la liste ci-dessus",
+        "  3️⃣  Mise sur ce costume au jeu N+1",
+        "  4️⃣  Si ce costume apparaît dans les cartes du jeu N+1 → ✅ Gagné",
         "",
-        f"_Données basées sur {len(perdues)} pertes analysées._",
+        f"_Analyse basée sur {len(perdues)} pertes · données live du cache._",
     ]
 
-    await event.respond("\n".join(lines), parse_mode='markdown')
+    await event.respond(
+        "\n".join(lines),
+        parse_mode='markdown',
+        buttons=[[Button.inline("📢 Envoyer au canal", b"send_formation_canal")]],
+    )
+
+
+async def cmd_sendformation(event):
+    """
+    /sendformation — Envoie le résumé de la formation dans le canal de prédiction.
+    Réservé à l'admin. Identique au bouton '📢 Envoyer au canal' de /formation.
+    """
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
+        await event.respond("🔒 Admin uniquement")
+        return
+    await _send_formation_to_canal()
+    await event.respond("✅ Message de formation envoyé dans le canal.")
+
+
+async def _send_formation_to_canal():
+    """Construit et envoie le message de formation dans le canal de prédiction."""
+    if not PREDICTION_CHANNEL_ID:
+        return
+
+    resolved = [
+        p for p in prediction_history
+        if p.get('status', 'en_cours') != 'en_cours'
+    ][:50]
+
+    if len(resolved) < 1:
+        if ADMIN_ID:
+            try:
+                await client.send_message(
+                    ADMIN_ID,
+                    "⚠️ Aucune prédiction résolue disponible pour générer un rapport de formation.",
+                    parse_mode='markdown',
+                )
+            except Exception:
+                pass
+        return
+
+    stats   = _compute_formation_stats(resolved)
+    f1_ok, f1_total, f1_rate = stats['f1']
+    f2_ok, f2_total, f2_rate = stats['f2']
+    f3_ok, f3_total, f3_rate = stats['f3']
+    best    = stats['best']
+    perdues = stats['perdues']
+
+    wins_total   = sum(1 for p in resolved if 'gagne' in p.get('status', ''))
+    losses_total = sum(1 for p in resolved if p.get('status') == 'perdu')
+
+    rank_labels = {
+        'f1': '1er costume du numéro prédit',
+        'f2': '2ème costume du numéro prédit',
+        'f3': '3ème costume du numéro prédit',
+    }
+    if best:
+        ok_b, tot_b, rate_b = stats[best]
+        label_b  = rank_labels[best]
+        rec_lines = [
+            f"✅ Mise sur le **{label_b}**",
+            f"   Taux de réussite : **{rate_b}%** ({ok_b}/{tot_b} pertes testées)",
+        ]
+        best_icon = "🥇"
+    else:
+        rec_lines = ["⚠️ Données insuffisantes pour recommander une formation."]
+        best_icon = "⚠️"
+
+    lines = [
+        "╔══════════════════════════════════════╗",
+        "║     📊 FORMATION DE MISE — RÉSUMÉ     ║",
+        "╚══════════════════════════════════════╝",
+        "",
+        f"Analyse : **{len(resolved)}** prédictions résolues",
+        f"  ✅ Gagnées : **{wins_total}**  |  ❌ Perdues : **{losses_total}**",
+        "",
+        "─── Taux de réussite par costume ───",
+    ]
+    if f1_total > 0:
+        star = ' ⭐' if best == 'f1' else ''
+        lines.append(f"  🥇 **1er costume du jeu prédit**{star}")
+        lines.append(f"       → **{f1_rate}%** ({f1_ok}/{f1_total})")
+    else:
+        lines.append("  🥇 1er costume : données insuffisantes")
+
+    if f2_total > 0:
+        star = ' ⭐' if best == 'f2' else ''
+        lines.append(f"  🥈 **2ème costume du jeu prédit**{star}")
+        lines.append(f"       → **{f2_rate}%** ({f2_ok}/{f2_total})")
+    else:
+        lines.append("  🥈 2ème costume : données insuffisantes")
+
+    if f3_total > 0:
+        star = ' ⭐' if best == 'f3' else ''
+        lines.append(f"  🥉 **3ème costume du jeu prédit**{star}")
+        lines.append(f"       → **{f3_rate}%** ({f3_ok}/{f3_total})")
+    else:
+        lines.append("  🥉 3ème costume : données insuffisantes")
+
+    lines += [
+        "",
+        f"─── {best_icon} Recommandation ───",
+    ] + rec_lines + [
+        "",
+        "💡 **Comment jouer après un PERDU au jeu N :**",
+        "  1️⃣  Regarde les costumes apparus au jeu N (le numéro prédit)",
+        "  2️⃣  Prends le costume recommandé ci-dessus",
+        "  3️⃣  Mise sur ce costume au jeu N+1",
+        "  4️⃣  Si ce costume apparaît au jeu N+1 → ✅ Gagné",
+        "",
+        f"_Analyse basée sur {perdues} pertes · {len(resolved)} prédictions résolues._",
+    ]
+
+    try:
+        channel = await resolve_channel(PREDICTION_CHANNEL_ID)
+        if channel:
+            await client.send_message(channel, "\n".join(lines), parse_mode='markdown')
+            logger.info("📢 Rapport de formation envoyé dans le canal de prédiction")
+    except Exception as e:
+        logger.error(f"❌ _send_formation_to_canal: {e}")
 
 
 # ============================================================================
@@ -9300,7 +9638,7 @@ async def cmd_b(event):
 
     # ── /b seul : tableau des B actuels + historique ────────────────────────
     if len(parts) == 1:
-        lines = [f"📏 **SEUILS B PAR COSTUME**", f"B admin (base) : **{compteur2_seuil_B}**\n"]
+        lines = ["📏 **SEUILS B PAR COSTUME**", f"B admin (base) : **{compteur2_seuil_B}**\n"]
         for suit in ALL_SUITS:
             sd  = SUIT_DISPLAY.get(suit, suit)
             cur = compteur2_seuil_B_per_suit.get(suit, compteur2_seuil_B)
@@ -9370,7 +9708,7 @@ async def cmd_b(event):
         B_LOSS_INCREMENT = inc_val
         await event.respond(
             f"✅ Incrément B après perte : **{old_inc}** → **{inc_val}**\n"
-            f"_(0 = pas d'augmentation automatique du B après une perte)_"
+            "_(0 = pas d'augmentation automatique du B après une perte)_"
         )
         db.db_schedule(save_runtime_config())
         return
@@ -9433,16 +9771,16 @@ async def cmd_b(event):
             if res['would_trigger']:
                 lines.append(
                     f"{sd}: B actuel={cur} | B admin={ini}\n"
-                    f"   ✅ Le B admin **aurait déclenché** une prédiction "
+                    "   ✅ Le B admin **aurait déclenché** une prédiction "
                     f"(absence max = {res['max_absence']} sur 100 jeux, "
                     f"jeux #{res.get('example_start','')}→#{res.get('example_end','')})\n"
-                    f"   → **Reset vers B admin recommandé dans 1h**"
+                    "   → **Reset vers B admin recommandé dans 1h**"
                 )
                 proposed.append(suit)
             else:
                 lines.append(
                     f"{sd}: B actuel={cur} | B admin={ini}\n"
-                    f"   ⚠️ Le B admin n'atteint pas encore le seuil "
+                    "   ⚠️ Le B admin n'atteint pas encore le seuil "
                     f"(absence max = {res['max_absence']}/{ini}) — reset non recommandé"
                 )
 
@@ -9455,7 +9793,7 @@ async def cmd_b(event):
                     snap = _analyse_b_suit(suit)
                     asyncio.create_task(
                         _scheduled_b_reset(suit, 3600,
-                                           f"Auto-analyse: B admin suffisant "
+                                           "Auto-analyse: B admin suffisant "
                                            f"(absence max={snap['max_absence']})")
                     )
         else:
@@ -9503,7 +9841,7 @@ async def cmd_favorables(event):
             return
 
         # Affichage statut
-        statut = "✅ Actif" if heures_favorables_active else "🔕 Désactivé"
+        statut = "✅ Acti" if heures_favorables_active else "🔕 Désactivé"
         saved_panel = await db.db_load_kv('active_panel')
         panel_info = "Aucun panneau actif"
         if saved_panel and saved_panel.get('active'):
@@ -9513,12 +9851,12 @@ async def cmd_favorables(event):
                 f"(msg_id={saved_panel.get('msg_id','?')})"
             )
         await event.respond(
-            f"🕐 **Système fenêtres favorables**\n"
+            "🕐 **Système fenêtres favorables**\n"
             f"Statut: {statut}\n"
-            f"Déclencheur: 2 événements C4 → fenêtre 3h (ou 30min si C14 équilibré)\n"
+            "Déclencheur: 2 événements C4 → fenêtre 3h (ou 30min si C14 équilibré)\n"
             f"C4 events accumulés: **{c4_favorable_event_count}/2**\n"
             f"Panneau actif: {panel_info}\n\n"
-            f"`/favorables on/off` — Activer/désactiver",
+            "`/favorables on/off` — Activer/désactiver",
             parse_mode='markdown'
         )
     except Exception as e:
@@ -9736,7 +10074,7 @@ async def cmd_panneaux(event):
         await client.send_file(
             admin_entity, fname,
             caption=(
-                f"🟦 **Panneaux Heures Favorables**\n"
+                "🟦 **Panneaux Heures Favorables**\n"
                 f"📋 {len(panels)} panneau(x) enregistré(s)\n"
                 f"🔢 Dernier N° : #{panels[0]['panel_number']}"
             ),
@@ -9888,7 +10226,7 @@ async def cmd_recherche(event):
         else:
             total_ev = len(compteur4_events) + len(compteur7_completed) + len(compteur8_completed)
             dispo_msg = (
-                f"📭 Aucune série dans cette plage de dates.\n"
+                "📭 Aucune série dans cette plage de dates.\n"
                 f"   Total en base : {total_ev} série(s) (toutes dates confondues)\n"
                 f"   Essaie `/recherche tout {max(1, hp - 5)}`"
             )
@@ -10023,7 +10361,7 @@ async def cmd_concours(event):
 
     # ─── Message 1 ───
     lines1 = [
-        f"🏆 **CONCOURS PAR COSTUME — EN COURS**",
+        "🏆 **CONCOURS PAR COSTUME — EN COURS**",
         f"📅 {now_str}  |  🎮 Jeu actuel: **#{jeu_actuel}**",
         f"⏳ Jeux restants avant #1440: **{restants}**",
         "",
@@ -10052,7 +10390,7 @@ async def cmd_concours(event):
 
     # ─── Message 2 ───
     lines2 = [
-        f"🥇 **CLASSEMENT PROVISOIRE**",
+        "🥇 **CLASSEMENT PROVISOIRE**",
         "",
     ]
     medals = ["🥇", "🥈", "🥉", "4️⃣"]
@@ -10067,7 +10405,7 @@ async def cmd_concours(event):
         "",
         f"👑 **CHAMPION PROVISOIRE: {SUIT_EMOJI[champion]} {SUIT_NAMES[champion]}** ({champ_pct}%)",
         "",
-        f"⚠️ Résultats provisoires — concours se termine au jeu **#1440**",
+        "⚠️ Résultats provisoires — concours se termine au jeu **#1440**",
         f"🔢 Il reste **{restants} jeux** pour renverser le classement.",
     ]
 
@@ -10123,9 +10461,9 @@ async def cmd_testpred(event):
         await db.db_set_prediction_message_id(fake_game, suit, mid)
 
         await event.respond(
-            f"✅ Prédiction test envoyée sur le canal\n"
+            "✅ Prédiction test envoyée sur le canal\n"
             f"👁 message_id = `{mid}` → game #{fake_game} {suit}\n"
-            f"Réagis au message dans le canal pour tester 🔔"
+            "Réagis au message dans le canal pour tester 🔔"
         )
     except Exception as e:
         logger.error(f"Erreur cmd_testpred: {e}")
@@ -10177,8 +10515,8 @@ async def cmd_verifier(event):
 
         lines += [
             "",
-            f"🔔 = suivi réactions actif",
-            f"🔕 = pas encore de message_id enregistré",
+            "🔔 = suivi réactions actif",
+            "🔕 = pas encore de message_id enregistré",
         ]
         await event.respond("\n".join(lines), parse_mode='markdown')
     except Exception as e:
@@ -10266,7 +10604,7 @@ async def on_reaction_event(update):
                         admin_entity = await client.get_entity(ADMIN_ID)
                         await client.send_message(
                             admin_entity,
-                            f"🔔 **Réaction détectée**\n"
+                            "🔔 **Réaction détectée**\n"
                             f"👤 **{name}** a réagi avec **{emoji}**\n"
                             f"📌 Prédiction jeu **#{game_number}**",
                             parse_mode='markdown'
@@ -10301,7 +10639,7 @@ async def on_reaction_event(update):
             admin_entity = await client.get_entity(ADMIN_ID)
             await client.send_message(
                 admin_entity,
-                f"🔔 **Réaction sur canal** (broadcast)\n"
+                "🔔 **Réaction sur canal** (broadcast)\n"
                 f"📌 Prédiction jeu **#{game_number}**\n"
                 f"{'  '.join(summary_parts)}",
                 parse_mode='markdown'
@@ -10359,7 +10697,7 @@ def _btns_hrs():
 def _btns_cmp():
     return [
         [Button.inline("C2 — Absences préd.",  b"c2"), Button.inline("C4 — Longues abs.", b"c4")],
-        [Button.inline("C5 — Patterns",        b"c5"), Button.inline("C6 — Dynamique Wj", b"c6")],
+        [Button.inline("C5 — Patterns",        b"c5"), Button.inline("C13 — Stratégie",   b"c6")],
         [Button.inline("C7 — Présences cons.", b"c7"), Button.inline("C8 — Absences mir.", b"c8")],
         [Button.inline("📊  Stats C1",          b"st_v")],
         [Button.inline("⬅️  Retour",            b"mn")],
@@ -10496,7 +10834,7 @@ async def handle_callback(event):
         elif data == 'hrs':
             now     = datetime.now()
             allowed = "✅ OUI" if is_prediction_time_allowed() else "❌ NON"
-            txt = (f"⏰ **HEURES DE PRÉDICTION**\n"
+            txt = ("⏰ **HEURES DE PRÉDICTION**\n"
                    f"Heure actuelle : **{now.strftime('%H:%M')}**  |  Autorisé : {allowed}\n"
                    f"Plages actives : {format_hours_config()}")
             await event.edit(txt, buttons=_btns_hrs())
@@ -10547,7 +10885,7 @@ async def handle_callback(event):
             auto_strategy_revert = {}
 
             await event.edit(
-                f"🔙 **Stratégie annulée** — paramètres précédents restaurés.\n"
+                "🔙 **Stratégie annulée** — paramètres précédents restaurés.\n"
                 f"  Miroir : **{prev_name}** · df+{prev_df_sim}\n"
                 f"  wx C13 : **{COMPTEUR13_THRESHOLD}** | B C2 : **{compteur2_seuil_B}**",
                 buttons=None,
@@ -10609,11 +10947,11 @@ async def handle_callback(event):
             hourly_pending_auto = None
 
             await event.edit(
-                f"✅ **Stratégie confirmée et appliquée !**\n\n"
+                "✅ **Stratégie confirmée et appliquée !**\n\n"
                 f"  Miroir : **{ba['name']}** ({ba['disp']})\n"
                 f"  wx C13 : **{ba['wx']}** | B C2 : **{ba['b']}** | df+{new_df_sim}\n"
                 f"  Score  : **{ba['score']:+d}** (✅{ba['wins']} ❌{ba['losses']} / {ba['total']})\n\n"
-                f"_Appuie sur Annuler dans la notification précédente pour revenir en arrière si besoin._",
+                "_Appuie sur Annuler dans la notification précédente pour revenir en arrière si besoin._",
                 buttons=[[Button.inline("❌ Annuler cette stratégie", b"cancel_auto_strat")]],
             )
             await event.answer("✅ Stratégie appliquée !")
@@ -10643,14 +10981,26 @@ async def handle_callback(event):
 
             await event.edit(
                 f"❌ **Proposition ignorée** ({heure_prop} — {ba_name})\n"
-                f"_La stratégie actuelle reste inchangée._",
+                "_La stratégie actuelle reste inchangée._",
                 buttons=None,
             )
             await event.answer("❌ Proposition ignorée.")
 
+        elif data == 'send_formation_canal':
+            await event.answer("📢 Envoi en cours…")
+            await _send_formation_to_canal()
+            try:
+                await event.edit(
+                    event.message.text + "\n\n✅ _Message de formation envoyé dans le canal._",
+                    buttons=None,
+                    parse_mode='markdown',
+                )
+            except Exception:
+                pass
+
         # ── Configuration ─────────────────────────────────────────────────────
         elif data == 'df_s':
-            pending_input[event.sender_id] = {'action': 'set_df', 'cid': cid}
+            pending_input[event.sender_id] = {'action': 'set_d', 'cid': cid}
             await event.answer()
             await client.send_message(cid, f"⏭️ **Modifier df**\nValeur actuelle : **{PREDICTION_DF}**\nEnvoyez la nouvelle valeur (1-10) :")
 
@@ -10823,14 +11173,14 @@ async def handle_callback(event):
             c2ch = f"`{COMPTEUR2_CHANNEL_ID}`"    if COMPTEUR2_CHANNEL_ID    else "❌ inactif"
             c3ch = f"`{PREDICTION_CHANNEL_ID3}`"  if PREDICTION_CHANNEL_ID3  else "❌ inactif"
             c4ch = f"`{PREDICTION_CHANNEL_ID4}`"  if PREDICTION_CHANNEL_ID4  else "❌ inactif"
-            txt  = (f"📡 **CONFIGURATION DES CANAUX**\n\n"
+            txt  = ("📡 **CONFIGURATION DES CANAUX**\n\n"
                     f"📤 Canal 1 (principal) : `{PREDICTION_CHANNEL_ID}`\n"
                     f"📤 Canal 2 (principal) : `{PREDICTION_CHANNEL_ID2}`\n"
                     f"📡 Canal 3 (redirect)  : {c3ch}\n"
                     f"📡 Canal 4 (redirect)  : {c4ch}\n"
                     f"🎯 Distribution        : {dist}\n"
                     f"📊 Compteur2           : {c2ch}\n\n"
-                    f"Canaux 3 et 4 reçoivent toutes les prédictions + résultats.")
+                    "Canaux 3 et 4 reçoivent toutes les prédictions + résultats.")
             await event.answer()
             await client.send_message(cid, txt)
 
@@ -10842,10 +11192,10 @@ async def handle_callback(event):
             await event.answer()
             cur = f"`{PREDICTION_CHANNEL_ID3}`" if PREDICTION_CHANNEL_ID3 else "inactif"
             await client.send_message(cid,
-                f"📡 **Canal 3 — Redirect prédictions + résultats**\n"
+                "📡 **Canal 3 — Redirect prédictions + résultats**\n"
                 f"Actuel : {cur}\n\n"
-                f"Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
-                f"⚠️ Le bot doit être **admin** dans ce canal."
+                "Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
+                "⚠️ Le bot doit être **admin** dans ce canal."
             )
 
         elif data == 'cn_3o':
@@ -10859,10 +11209,10 @@ async def handle_callback(event):
             await event.answer()
             cur = f"`{PREDICTION_CHANNEL_ID4}`" if PREDICTION_CHANNEL_ID4 else "inactif"
             await client.send_message(cid,
-                f"📡 **Canal 4 — Redirect prédictions + résultats**\n"
+                "📡 **Canal 4 — Redirect prédictions + résultats**\n"
                 f"Actuel : {cur}\n\n"
-                f"Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
-                f"⚠️ Le bot doit être **admin** dans ce canal."
+                "Envoyez le nouvel ID de canal (nombre négatif, ex: `-1001234567890`).\n"
+                "⚠️ Le bot doit être **admin** dans ce canal."
             )
 
         elif data == 'cn_4o':
@@ -10973,6 +11323,35 @@ async def handle_callback(event):
             pending_input[event.sender_id] = {'action': 'testpred', 'cid': cid}
             await event.answer()
             await client.send_message(cid, "🧪 **Test prédiction**\nEnvoyez le numéro du jeu cible (ex : `1080`) :")
+
+        # ── Mode emploi ───────────────────────────────────────────────────────
+        elif data == 'em_v':
+            await event.answer("📖 Chargement mode emploi…")
+            await cmd_help(_fake_ev(cid, '/help'))
+
+        # ── C6 → redirigé vers stratégie C13 (Raison2) ───────────────────────
+        elif data == 'c6':
+            await event.answer("📊 Chargement stratégie C13…")
+            await cmd_raison2(_fake_ev(cid, '/raison2'))
+
+        # ── Infos canaux (boutons titre — affichent statut en popup) ──────────
+        elif data == 'cn_3m':
+            ch3 = PREDICTION_CHANNEL_ID3
+            txt = f"📡 Canal 3 : {'✅ Actif — ID ' + str(ch3) if ch3 else '❌ Inactif'}"
+            await event.answer(txt, alert=True)
+
+        elif data == 'cn_4m':
+            ch4 = PREDICTION_CHANNEL_ID4
+            txt = f"📡 Canal 4 : {'✅ Actif — ID ' + str(ch4) if ch4 else '❌ Inactif'}"
+            await event.answer(txt, alert=True)
+
+        elif data == 'cn_dm':
+            txt = f"🎯 Distribution : {'✅ Actif — ID ' + str(DISTRIBUTION_CHANNEL_ID) if DISTRIBUTION_CHANNEL_ID else '❌ Inactif'}"
+            await event.answer(txt, alert=True)
+
+        elif data == 'cn_cm':
+            txt = f"📊 Compteur2 : {'✅ Actif — ID ' + str(COMPTEUR2_CHANNEL_ID) if COMPTEUR2_CHANNEL_ID else '❌ Inactif'}"
+            await event.answer(txt, alert=True)
 
         else:
             await event.answer()
@@ -11097,7 +11476,7 @@ async def handle_admin_input(event):
             PREDICTION_CHANNEL_ID3 = new_id
             await event.respond(
                 f"✅ **Canal 3 activé : {old or 'inactif'} → `{new_id}`**\n"
-                f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                "Toutes les prédictions + résultats seront redirigés vers ce canal."
             )
             db.db_schedule(save_runtime_config())
 
@@ -11116,7 +11495,7 @@ async def handle_admin_input(event):
             PREDICTION_CHANNEL_ID4 = new_id
             await event.respond(
                 f"✅ **Canal 4 activé : {old or 'inactif'} → `{new_id}`**\n"
-                f"Toutes les prédictions + résultats seront redirigés vers ce canal."
+                "Toutes les prédictions + résultats seront redirigés vers ce canal."
             )
             db.db_schedule(save_runtime_config())
 
@@ -11192,7 +11571,8 @@ def setup_handlers():
     client.add_event_handler(cmd_compteur13, events.NewMessage(pattern=r'^/compteur13'))
     client.add_event_handler(cmd_strategie,           events.NewMessage(pattern=r'^/strategie$'))
     client.add_event_handler(cmd_historique_strategies, events.NewMessage(pattern=r'^/historique_strategies'))
-    client.add_event_handler(cmd_formation,             events.NewMessage(pattern=r'^/formation'))
+    client.add_event_handler(cmd_formation,             events.NewMessage(pattern=r'^/formation(?!_)'))
+    client.add_event_handler(cmd_sendformation,         events.NewMessage(pattern=r'^/sendformation'))
     client.add_event_handler(cmd_oui,        events.NewMessage(pattern=r'(?i)^oui\s*\d*$'))
     client.add_event_handler(cmd_compteur14, events.NewMessage(pattern=r'^/compteur14'))
     client.add_event_handler(cmd_comparaison, events.NewMessage(pattern=r'^/comparaison'))
@@ -11310,10 +11690,10 @@ async def start_bot():
                     logger.error(f"❌ Canal 2 inaccessible ({PREDICTION_CHANNEL_ID2}) — le bot n'est pas admin ou n'a pas accès")
                     try:
                         await client.send_message(ADMIN_ID,
-                            f"⚠️ **CANAL 2 INACCESSIBLE**\n"
+                            "⚠️ **CANAL 2 INACCESSIBLE**\n"
                             f"ID : `{PREDICTION_CHANNEL_ID2}`\n"
-                            f"Le bot ne peut pas envoyer dans ce canal.\n"
-                            f"→ Vérifie que le bot est **admin** du canal."
+                            "Le bot ne peut pas envoyer dans ce canal.\n"
+                            "→ Vérifie que le bot est **admin** du canal."
                         )
                     except Exception:
                         pass
@@ -11329,10 +11709,10 @@ async def start_bot():
                     logger.error(f"❌ Canal 3 inaccessible ({PREDICTION_CHANNEL_ID3})")
                     try:
                         await client.send_message(ADMIN_ID,
-                            f"⚠️ **CANAL 3 INACCESSIBLE**\n"
+                            "⚠️ **CANAL 3 INACCESSIBLE**\n"
                             f"ID : `{PREDICTION_CHANNEL_ID3}`\n"
-                            f"Le bot ne peut pas envoyer dans ce canal.\n"
-                            f"→ Vérifie que le bot est **admin** du canal."
+                            "Le bot ne peut pas envoyer dans ce canal.\n"
+                            "→ Vérifie que le bot est **admin** du canal."
                         )
                     except Exception:
                         pass
@@ -11350,10 +11730,10 @@ async def start_bot():
                     logger.error(f"❌ Canal 4 inaccessible ({PREDICTION_CHANNEL_ID4})")
                     try:
                         await client.send_message(ADMIN_ID,
-                            f"⚠️ **CANAL 4 INACCESSIBLE**\n"
+                            "⚠️ **CANAL 4 INACCESSIBLE**\n"
                             f"ID : `{PREDICTION_CHANNEL_ID4}`\n"
-                            f"Le bot ne peut pas envoyer dans ce canal.\n"
-                            f"→ Vérifie que le bot est **admin** du canal."
+                            "Le bot ne peut pas envoyer dans ce canal.\n"
+                            "→ Vérifie que le bot est **admin** du canal."
                         )
                     except Exception:
                         pass
@@ -11407,7 +11787,7 @@ async def main():
                 background_started = True
 
             logger.info(f"📏 Écart: {MIN_GAP_BETWEEN_PREDICTIONS}")
-            logger.info(f"📡 Source: 1xBet API (polling toutes les 4s)")
+            logger.info("📡 Source: 1xBet API (polling toutes les 4s)")
             logger.info(f"📊 Compteur4 seuil: {COMPTEUR4_THRESHOLD}")
             logger.info(f"⏰ Restriction horaire: {'ACTIVE' if PREDICTION_HOURS else 'INACTIVE (24h/24)'}")
             if RENDER_EXTERNAL_URL:

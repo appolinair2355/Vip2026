@@ -1,0 +1,94 @@
+============================================================
+  BACCARAT AI — Guide de déploiement
+============================================================
+
+FICHIERS INCLUS
+---------------
+main.py          — Bot principal
+config.py        — Configuration et variables d'environnement
+db.py            — Couche base de données PostgreSQL
+api_utils.py     — Client API 1xBet
+parole.py        — Système de génération de paroles
+requirements.txt — Dépendances Python
+render.yaml      — Config Render.com (déploiement automatique)
+Procfile         — Pour Railway / Heroku
+
+------------------------------------------------------------
+VARIABLES D'ENVIRONNEMENT OBLIGATOIRES
+------------------------------------------------------------
+TELEGRAM_SESSION        — Session Telethon (string)
+API_ID                  — Telegram API ID (integer)
+API_HASH                — Telegram API Hash (string)
+BOT_TOKEN               — Token du bot Telegram
+ADMIN_ID                — ID Telegram de l'administrateur
+DATABASE_URL            — URL PostgreSQL complète
+
+VARIABLES OPTIONNELLES (défaut = 0 = désactivé)
+------------------------------------------------------------
+PREDICTION_CHANNEL_ID   — Canal principal (ex: -1003848194038)
+PREDICTION_CHANNEL_ID2  — Canal secondaire
+PREDICTION_CHANNEL_ID3  — Canal 3
+PREDICTION_CHANNEL_ID4  — Canal 4
+DISTRIBUTION_CHANNEL_ID — Canal distribution
+COMPTEUR2_CHANNEL_ID    — Canal compteur2
+PORT                    — Port HTTP keep-alive (défaut: 8000)
+LOG_LEVEL               — Niveau de log (défaut: INFO)
+RENDER_URL              — URL publique (pour keep-alive automatique)
+
+------------------------------------------------------------
+DÉPLOIEMENT RENDER.COM
+------------------------------------------------------------
+1. Créer un compte sur render.com
+2. Nouveau service → "Web Service" → importer depuis GitHub ou
+   uploader les fichiers
+3. Runtime : Python
+4. Build Command  : pip install -r requirements.txt
+5. Start Command  : python main.py
+6. Health Check   : /health
+7. Ajouter toutes les variables d'environnement listées ci-dessus
+8. PostgreSQL : créer une "New PostgreSQL" dans Render,
+   copier l'URL interne dans DATABASE_URL
+9. Plan recommandé : "Starter" ($7/mois) pour éviter les spin-down
+
+------------------------------------------------------------
+DÉPLOIEMENT RAILWAY.APP
+------------------------------------------------------------
+1. Importer le projet (GitHub ou upload)
+2. Ajouter les variables d'environnement
+3. Railway détecte le Procfile automatiquement
+4. Ajouter un service PostgreSQL → copier DATABASE_URL
+
+------------------------------------------------------------
+DÉPLOIEMENT VPS (Ubuntu/Debian)
+------------------------------------------------------------
+1. Copier les fichiers sur le VPS
+2. Installer les dépendances :
+     python3 -m pip install -r requirements.txt
+3. Créer un fichier .env avec toutes les variables
+4. Lancer avec systemd ou screen :
+     screen -S baccarat python3 main.py
+   ou créer un service systemd :
+     [Unit]
+     Description=Baccarat AI Bot
+     After=network.target
+
+     [Service]
+     WorkingDirectory=/path/to/bot
+     ExecStart=/usr/bin/python3 main.py
+     EnvironmentFile=/path/to/.env
+     Restart=always
+     RestartSec=5
+
+     [Install]
+     WantedBy=multi-user.target
+
+------------------------------------------------------------
+NOTES IMPORTANTES
+------------------------------------------------------------
+- La base de données PostgreSQL est OBLIGATOIRE (pas de SQLite)
+- Le bot démarre un serveur HTTP sur le port PORT pour les
+  health checks et le keep-alive
+- Toutes les données (prédictions, historique, sessions) sont
+  persistées en base de données
+- Le bot se reconnecte automatiquement en cas de coupure réseau
+============================================================

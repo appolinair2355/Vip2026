@@ -2,3 +2,5 @@ telethon>=1.28.5
 aiohttp>=3.8.4
 fpdf2>=2.7.9
 asyncpg>=0.29.0
+fpdf
+fpdf2

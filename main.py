@@ -75,6 +75,16 @@ api_silence_alerted: bool = False  # évite de spammer l'admin
 # Suivi formation : stocke la dernière meilleure formation ("f1", "f2", "f3", None)
 _last_formation_best: Optional[str] = None
 
+# Dernier exemple concret de formation déclenché (pour message canal horaire)
+_last_formation_example: Optional[Dict] = None
+# {
+#   'original_game': int,          # jeu N prédit
+#   'original_suit': str,          # costume prédit (normalisé)
+#   'card_position': str,          # '1ère', '2ème', '3ème'
+#   'recommended_suit': str,       # costume recommandé pour N+1
+#   'next_game': int,              # jeu N+1 à vérifier
+# }
+
 # Formation follow-up : {game_to_check: {recommended_suit, canal_msg_id, original_game, ...}}
 formation_follow_ups: Dict[int, dict] = {}
 
@@ -1617,7 +1627,15 @@ async def auto_strategy_hourly_loop():
                 f"score={r_score:+d} (✅{r_wins} ❌{r_losses} / {r_recent} pred.)"
             )
 
-            await propose_hourly_strategy(best_auto, heure)
+            if best_auto.get('is_fallback', False):
+                # Fallback (a des pertes) → proposition manuelle ✅/❌ à l'admin
+                await propose_hourly_strategy(best_auto, heure)
+            else:
+                # 0 perte → application automatique immédiate, admin reçoit ❌ Annuler
+                await apply_best_strategy_auto(best_auto)
+
+            # ── Message de formation simple au canal (toutes les heures pile) ──
+            asyncio.ensure_future(_send_formation_simple_to_canal(heure))
 
         except Exception as e:
             logger.error(f"❌ auto_strategy_hourly_loop: {e}")
@@ -4873,6 +4891,11 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                     pred['rattrapage'] = 1
                     next_check = game_number + 1
                     logger.info(f"❌ #{game_number} terminé sans {target_suit}, attente R1 #{next_check}")
+                    # Formation : jeu prédit terminé → comparer ses 3 cartes → costume pour #N+1
+                    try:
+                        await _trigger_formation_follow_up(game_number, target_suit, game_number, dict(pred))
+                    except Exception as _fex:
+                        logger.error(f"❌ Formation follow-up #{game_number}: {_fex}")
                     await update_prediction_progress(game_number, next_check)
                 else:
                     # ⏳ Partie en cours, costume pas encore là → re-vérifier au prochain poll
@@ -4989,12 +5012,6 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                 pred['rattrapage'] = rattrapage + 1
                 next_check = original_game + rattrapage + 1
                 logger.info(f"❌ R{rattrapage} terminé sans {target_suit}, attente R{rattrapage+1} #{next_check}")
-                # Premier échec (R0) → calculer et afficher la formation de mise
-                if rattrapage == 0:
-                    try:
-                        await _trigger_formation_follow_up(original_game, target_suit, check_game, dict(pred))
-                    except Exception as _fex:
-                        logger.error(f"❌ Formation follow-up #{original_game}: {_fex}")
                 await update_prediction_progress(original_game, next_check)
             else:
                 # ❌ Statut final : PERDU R2 → nettoyer le cache de ce jeu
@@ -5403,51 +5420,43 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
     # Victoire immédiate si costume trouvé, échec seulement si partie entièrement terminée
     await check_prediction_result(game_number, player_suits, is_finished)
 
-    # ── Vérification formation follow-up (R0 → R1 → R2, max 2 rattrapages) ──
+    # ── Vérification formation (1 seul check au jeu prédit+1, pas de rattrapage) ──
     if player_hand_complete and game_number in formation_follow_ups:
-        fup          = formation_follow_ups.pop(game_number)
-        rec_suit     = fup['recommended_suit']
-        orig_game    = fup['original_game']
-        fup_ratt     = fup.get('rattrapage', 0)          # 0, 1 ou 2
-        orig_check   = fup.get('check_game_orig', game_number - 1)
-        rec_disp     = SUIT_DISPLAY.get(rec_suit, rec_suit)
-        active_pred  = pending_predictions.get(orig_game)
+        fup         = formation_follow_ups.pop(game_number)
+        rec_suit    = fup['recommended_suit']
+        orig_game   = fup['original_game']
+        card_pos    = fup.get('card_position', '?')   # '1ère', '2ème' ou '3ème'
+        rec_disp    = SUIT_DISPLAY.get(rec_suit, rec_suit)
+        active_pred = pending_predictions.get(orig_game)
 
-        if active_pred:
-            if rec_suit in player_suits:
-                # ✅ Costume trouvé → formation réussie
-                active_pred['formation_suffix'] = (
-                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
-                    "✅ Présent — formation réussie !"
-                )
-                logger.info(f"✅ Formation R{fup_ratt} validée #{orig_game} → {rec_suit} au #{game_number}")
+        # Vérifier toutes les cartes du jeu prédit (#N) présentes au jeu #N+1
+        # pour savoir quelle position est sortie (informatif)
+        cards_orig  = fup.get('cards_at_predicted', [])  # [suit1, suit2, suit3] de #N
+        pos_labels  = ['1ère', '2ème', '3ème']
+        found_pos   = None
+        for idx, cs in enumerate(cards_orig):
+            if cs in player_suits:
+                found_pos = pos_labels[idx] if idx < len(pos_labels) else f'{idx+1}ème'
+                break  # on enregistre la 1ère trouvée par ordre d'apparition
 
-            elif fup_ratt < 2:
-                # ❌ Raté mais encore des rattrapages → on réenregistre pour le jeu suivant
-                next_fup = game_number + 1
-                formation_follow_ups[next_fup] = {
-                    'recommended_suit': rec_suit,
-                    'original_game':    orig_game,
-                    'original_suit':    fup.get('original_suit', rec_suit),
-                    'rattrapage':       fup_ratt + 1,
-                    'check_game_orig':  orig_check,
-                }
-                level_map = {0: '🟩 R1', 1: '🟨 R2'}
-                next_level = level_map.get(fup_ratt, '🟥')
+        if rec_suit in player_suits:
+            # ✅ La carte recommandée est présente → formation réussie
+            logger.info(f"✅ Formation validée #{orig_game} → {rec_suit} ({card_pos} carte) présent au #{game_number}")
+            if active_pred:
                 active_pred['formation_suffix'] = (
-                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
-                    f"❌ Absent — {next_level} formation → vérif au **#{next_fup}**\n"
-                    "⏳ _Analyse..._"
+                    f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte) au jeu **#{game_number}**\n"
+                    f"✅ Présent — formation réussie !"
                 )
-                logger.info(f"❌ Formation R{fup_ratt} ratée #{orig_game} → relance R{fup_ratt+1} au #{next_fup}")
-
-            else:
-                # ❌ R2 raté → formation définitivement perdue
+        else:
+            # ❌ La carte recommandée est absente — on note quelle autre carte est sortie si applicable
+            note = f" (c'est la **{found_pos}** carte qui est sortie)" if found_pos else ""
+            logger.info(f"❌ Formation ratée #{orig_game} → {rec_suit} absent au #{game_number}{note}")
+            if active_pred:
                 active_pred['formation_suffix'] = (
-                    f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{game_number}**\n"
-                    "❌ Absent — formation définitivement ratée (R2)"
+                    f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte) au jeu **#{game_number}**\n"
+                    f"❌ Absent{note}"
                 )
-                logger.info(f"❌ Formation R2 finale ratée #{orig_game} → {rec_suit} absent au #{game_number}")
+        # Formation terminée — pas de rattrapage R1/R2
 
     # File de prédictions : envoie dès que la main joueur est complète (N+df match)
     await process_prediction_queue(game_number, player_hand_complete)
@@ -9213,11 +9222,11 @@ def _compute_formation_stats(resolved: list) -> dict:
 
 async def _trigger_formation_follow_up(original_game: int, original_suit: str, check_game: int, pred_snap: dict):
     """
-    Appelée dès le premier échec (R0) au jeu prédit.
-    1. Calcule la meilleure formation sur les prédictions résolues.
-    2. Identifie le costume recommandé parmi les cartes du jeu check_game (jeu prédit).
-    3. Ajoute "Formation :[costume]" comme suffixe dans le message d'animation existant.
-    4. Enregistre dans formation_follow_ups[check_game+1] pour vérification au jeu suivant.
+    Appelée dès que le jeu prédit (original_game) se termine sans le costume attendu.
+    1. Lit les 3 cartes joueur du jeu check_game (= jeu prédit).
+    2. Détermine historiquement quel costume (1er/2ème/3ème) apparaît le plus souvent au jeu suivant.
+    3. Recommande ce costume pour check_game+1 et l'injecte dans le message de prédiction.
+    4. Enregistre formation_follow_ups[check_game+1] pour vérification (R0 → R1 → R2).
     """
     global formation_follow_ups
 
@@ -9245,9 +9254,12 @@ async def _trigger_formation_follow_up(original_game: int, original_suit: str, c
     else:
         best  = 'f1'
 
-    rank_label = rank_labels.get(best, best)
+    # Labels position carte : f1=1ère, f2=2ème, f3=3ème
+    pos_label_map = {'f1': '1ère', 'f2': '2ème', 'f3': '3ème'}
+    rank_label    = rank_labels.get(best, best)
+    card_pos      = pos_label_map.get(best, '1ère')
 
-    # ── Costume recommandé ───────────────────────────────────────────────────
+    # ── Costume recommandé (idx dans les cartes du jeu prédit) ───────────────
     idx_map = {'f1': 0, 'f2': 1, 'f3': 2}
     idx     = idx_map.get(best, 0)
     if idx >= len(cards_appeared):
@@ -9256,27 +9268,38 @@ async def _trigger_formation_follow_up(original_game: int, original_suit: str, c
     rec_disp = SUIT_DISPLAY.get(recommended_suit, recommended_suit)
 
     # ── Injecter le suffixe dans la prédiction en cours ──────────────────────
+    next_game = check_game + 1
     formation_suffix = (
-        f"\n\n♟️ **Formation** : **{rec_disp}** au jeu **#{check_game + 1}**\n"
+        f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte du #**{check_game}**) → jeu **#{next_game}**\n"
         "⏳ _Analyse..._"
     )
     active_pred = pending_predictions.get(original_game)
     if active_pred:
         active_pred['formation_suffix'] = formation_suffix
-        logger.info(f"✅ Formation injectée → prédiction #{original_game} | costume:{rec_disp} | position:{rank_label}")
+        logger.info(f"✅ Formation injectée → prédiction #{original_game} | {rec_disp} ({card_pos} carte) → #{next_game}")
     else:
-        logger.warning(f"⚠️ Formation #{original_game}: prédiction absente de pending_predictions — suffixe non injecté")
+        logger.warning(f"⚠️ Formation #{original_game}: prédiction absente — suffixe non injecté")
 
-    # ── Enregistrer le follow-up pour le jeu suivant (rattrapage 0/1/2) ─────
-    next_game = check_game + 1
+    # ── Enregistrer le follow-up pour le jeu #N+1 (1 seul check, pas de rattrapage) ─
     formation_follow_ups[next_game] = {
-        'recommended_suit': recommended_suit,
+        'recommended_suit':   recommended_suit,
+        'original_game':      original_game,
+        'original_suit':      original_suit,
+        'card_position':      card_pos,           # '1ère', '2ème' ou '3ème'
+        'cards_at_predicted': cards_appeared,     # liste ordonnée des costumes du jeu prédit
+        'check_game_orig':    check_game,
+    }
+    logger.info(f"📊 Formation #{original_game} → {rec_disp} [{card_pos} carte de #{check_game}] vérif au #{next_game}")
+
+    # ── Mémoriser le dernier exemple pour le message canal horaire ────────────
+    global _last_formation_example
+    _last_formation_example = {
         'original_game':    original_game,
         'original_suit':    original_suit,
-        'rattrapage':       0,          # R0 formation : première vérification
-        'check_game_orig':  check_game, # jeu du R0 raté (pour affichage)
+        'card_position':    card_pos,
+        'recommended_suit': recommended_suit,
+        'next_game':        next_game,
     }
-    logger.info(f"📊 Formation #{original_game} → {rec_disp} [{rank_label}] (vérif R0 au #{next_game})")
 
 
 async def cmd_formation(event):
@@ -9414,7 +9437,7 @@ async def cmd_formation(event):
     await event.respond(
         "\n".join(lines),
         parse_mode='markdown',
-        buttons=[[Button.inline("📢 Envoyer au canal", b"send_formation_canal")]],
+        buttons=[[Button.inline("📊 Rapport détaillé (admin)", b"send_formation_canal")]],
     )
 
 
@@ -9429,7 +9452,7 @@ async def cmd_sendformation(event):
         await event.respond("🔒 Admin uniquement")
         return
     await _send_formation_to_canal()
-    await event.respond("✅ Message de formation envoyé dans le canal.")
+    await event.respond("✅ Rapport de formation détaillé envoyé en privé.\n_Le canal reçoit le conseil simplifié à chaque heure pile._")
 
 
 async def _send_formation_to_canal():
@@ -9527,12 +9550,68 @@ async def _send_formation_to_canal():
     ]
 
     try:
+        if ADMIN_ID:
+            await client.send_message(ADMIN_ID, "\n".join(lines), parse_mode='markdown')
+            logger.info("📊 Rapport de formation détaillé envoyé à l'admin")
+    except Exception as e:
+        logger.error(f"❌ _send_formation_to_canal (admin): {e}")
+
+
+async def _send_formation_simple_to_canal(heure: str = ''):
+    """
+    Envoie chaque heure un message simple de formation dans le canal de prédiction.
+    Message court : quelle carte jouer après un PERDU, avec exemple concret.
+    Détails statistiques réservés à l'admin via _send_formation_to_canal().
+    """
+    if not PREDICTION_CHANNEL_ID:
+        return
+
+    resolved = [
+        p for p in prediction_history
+        if p.get('status', 'en_cours') != 'en_cours'
+    ][:50]
+    perdu_list = [p for p in resolved if p.get('status') == 'perdu']
+
+    if len(perdu_list) < 3:
+        logger.info("📊 Formation canal simple : pas assez de pertes pour envoyer un conseil")
+        return
+
+    stats = _compute_formation_stats(resolved)
+    best  = stats['best'] or 'f1'
+
+    pos_label = {'f1': '1ère', 'f2': '2ème', 'f3': '3ème'}.get(best, '1ère')
+    ok_b, tot_b, rate_b = stats[best]
+
+    # ── Construire l'exemple concret depuis le dernier exemple mémorisé ──────
+    ex_lines = []
+    if _last_formation_example:
+        ex = _last_formation_example
+        orig_disp = SUIT_DISPLAY.get(ex['original_suit'], ex['original_suit'])
+        rec_disp  = SUIT_DISPLAY.get(ex['recommended_suit'], ex['recommended_suit'])
+        ex_lines = [
+            "",
+            f"_Exemple (dernière prédiction) :_",
+            f"Jeu **#{ex['original_game']}** prédit {orig_disp} — absent",
+            f"→ Mise sur {rec_disp} ({ex['card_position']} carte) au jeu **#{ex['next_game']}**",
+        ]
+
+    heure_str = f" · {heure}" if heure else ''
+    lines = [
+        f"♟️ **Formation de mise**{heure_str}",
+        "",
+        "📌 **Conseil :**",
+        f"Si le bot envoie une prédiction et qu'elle ne reçoit pas son costume,",
+        f"misez sur la **{pos_label} carte** apparue au jeu prédit,",
+        f"au jeu suivant.",
+    ] + ex_lines
+
+    try:
         channel = await resolve_channel(PREDICTION_CHANNEL_ID)
         if channel:
             await client.send_message(channel, "\n".join(lines), parse_mode='markdown')
-            logger.info("📢 Rapport de formation envoyé dans le canal de prédiction")
+            logger.info(f"📢 Conseil formation simple envoyé au canal ({pos_label} carte recommandée)")
     except Exception as e:
-        logger.error(f"❌ _send_formation_to_canal: {e}")
+        logger.error(f"❌ _send_formation_simple_to_canal: {e}")
 
 
 # ============================================================================
@@ -10987,11 +11066,11 @@ async def handle_callback(event):
             await event.answer("❌ Proposition ignorée.")
 
         elif data == 'send_formation_canal':
-            await event.answer("📢 Envoi en cours…")
+            await event.answer("📊 Rapport envoyé en privé…")
             await _send_formation_to_canal()
             try:
                 await event.edit(
-                    event.message.text + "\n\n✅ _Message de formation envoyé dans le canal._",
+                    event.message.text + "\n\n✅ _Rapport détaillé reçu en privé._",
                     buttons=None,
                     parse_mode='markdown',
                 )

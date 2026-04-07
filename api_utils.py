@@ -1,7 +1,10 @@
 import json
 import asyncio
 import random
+import logging
 import aiohttp
+
+logger = logging.getLogger(__name__)
 
 API_URL = "https://1xbet.com/service-api/LiveFeed/GetSportsShortZip"
 API_PARAMS = {

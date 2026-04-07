@@ -103,6 +103,7 @@ game_result_cache: Dict[int, dict] = {}
 processed_games: Set[int] = set()  # Jeux déjà comptabilisés (compteur2, compteur4)
 prediction_checked_games: Set[int] = set()  # Jeux dont les prédictions ont été vérifiées
 recently_predicted: Set[int] = set()  # Anti-doublon : game_numbers déjà envoyés (jamais re-sendés)
+_sending_lock:      Set[int] = set()  # Envois en cours (verrou réentrance) — bloque concurrent
 
 # Proposition de stratégie en attente de confirmation ("Oui")
 pending_strategy_proposal: Dict = {}   # {name, changes, description, expires}
@@ -2780,13 +2781,7 @@ async def send_compteur13_alert(trigger: Dict, current_game: int):
             'game_offset':  game_offset,
             'count':        count,
         }
-        added = add_to_prediction_queue(
-            pred_game, suit_pred, 'compteur13', reason,
-            trigger_game=game_trigger, skip_c6=True, meta=c13_meta
-        )
-        if added:
-            logger.info(f"🎯 C13: prédiction #{pred_game} {suit_pred} en file")
-            await send_prediction_multi_channel(pred_game, suit_pred, 'compteur13', skip_c6=True, meta=c13_meta)
+        await send_prediction_multi_channel(pred_game, suit_pred, 'compteur13', skip_c6=True, meta=c13_meta)
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur13_alert: {e}")
 
@@ -2990,13 +2985,7 @@ async def send_compteur8_pred_alert(
     """
     try:
         suit_disp = SUIT_DISPLAY.get(suit, suit)
-        added = add_to_prediction_queue(
-            pred_game, suit, 'compteur8_pred', reason,
-            trigger_game=trigger_game, skip_c6=True
-        )
-        if added:
-            logger.info(f"🔴 C8 PRED: #{pred_game} {suit} en file (trigger #{trigger_game})")
-            await send_prediction_multi_channel(pred_game, suit, 'compteur8_pred', skip_c6=True)
+        await send_prediction_multi_channel(pred_game, suit, 'compteur8_pred', skip_c6=True)
 
         # Informer l'admin si C8 a bloqué d'autres compteurs
         if blocked_others and ADMIN_ID:
@@ -4424,7 +4413,7 @@ def stop_all_animations():
 
 def format_prediction_message(game_number: int, suit: str, status: str = 'en_cours',
                               current_check: int = None, verified_games: List[int] = None,
-                              rattrapage: int = 0) -> str:
+                              rattrapage: int = 0, formation_color: str = '') -> str:
     suit_display = SUIT_DISPLAY.get(suit, suit)
 
     if status == 'en_cours':
@@ -4448,17 +4437,19 @@ def format_prediction_message(game_number: int, suit: str, status: str = 'en_cou
     elif status == 'gagne':
         num_emoji = ['0️⃣', '1️⃣', '2️⃣', '3️⃣']
         badge = num_emoji[rattrapage] if rattrapage < len(num_emoji) else f'{rattrapage}️⃣'
+        indicator = formation_color if formation_color else '✅'
         return (
             f"🏆 **PRÉDICTION #{game_number}**\n\n"
             f"🎯 **Couleur:** {suit_display}\n"
-            f"✅ **Statut:** ✅{badge} GAGNÉ"
+            f"✅ **Statut:** {indicator}{badge} GAGNÉ"
         )
 
     elif status == 'perdu':
+        indicator = f"{formation_color} " if formation_color else ''
         return (
             f"💔 **PRÉDICTION #{game_number}**\n\n"
             f"🎯 **Couleur:** {suit_display}\n"
-            "❌ **Statut:** PERDU 😭"
+            f"❌ **Statut:** {indicator}PERDU 😭"
         )
 
     elif status == 'expirée_api':
@@ -4496,6 +4487,21 @@ async def send_prediction_to_channel(channel_id: int, game_number: int, suit: st
         return None
 
 async def send_prediction_multi_channel(game_number: int, suit: str, prediction_type: str = 'standard', skip_c6: bool = False, meta: Optional[Dict] = None) -> bool:
+    global last_prediction_time, last_prediction_number_sent, DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
+
+    # ── Verrou de réentrance : bloque tout envoi concurrent pour le même jeu ──
+    if game_number in _sending_lock:
+        logger.warning(f"🔒 #{game_number} envoi déjà en cours — doublon bloqué (lock)")
+        return False
+    _sending_lock.add(game_number)
+
+    try:
+        return await _send_prediction_multi_channel_inner(game_number, suit, prediction_type, skip_c6, meta)
+    finally:
+        _sending_lock.discard(game_number)
+
+
+async def _send_prediction_multi_channel_inner(game_number: int, suit: str, prediction_type: str = 'standard', skip_c6: bool = False, meta: Optional[Dict] = None) -> bool:
     global last_prediction_time, last_prediction_number_sent, DISTRIBUTION_CHANNEL_ID, COMPTEUR2_CHANNEL_ID
 
     # Vérification restriction horaire
@@ -4662,7 +4668,9 @@ async def update_prediction_message(game_number: int, status: str, rattrapage: i
     pred = pending_predictions[game_number]
     suit = pred['suit']
     msg_id = pred['message_id']
-    new_msg = format_prediction_message(game_number, suit, status, rattrapage=rattrapage)
+    formation_color = pred.get('formation_color', '')
+    new_msg = format_prediction_message(game_number, suit, status, rattrapage=rattrapage,
+                                        formation_color=formation_color)
 
     # Déterminer la clé de parole selon le statut
     parole_key = None
@@ -5439,23 +5447,70 @@ async def process_game_result(game_number: int, player_suits: Set[str], player_c
                 found_pos = pos_labels[idx] if idx < len(pos_labels) else f'{idx+1}ème'
                 break  # on enregistre la 1ère trouvée par ordre d'apparition
 
+        _FORMATION_LEGEND = "\n_🟨 = Formation gagnée · 🔴 = Formation perdue_"
+
         if rec_suit in player_suits:
-            # ✅ La carte recommandée est présente → formation réussie
-            logger.info(f"✅ Formation validée #{orig_game} → {rec_suit} ({card_pos} carte) présent au #{game_number}")
-            if active_pred:
-                active_pred['formation_suffix'] = (
-                    f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte) au jeu **#{game_number}**\n"
-                    f"✅ Présent — formation réussie !"
-                )
+            # 🟨 La carte recommandée est présente → formation gagnée
+            logger.info(f"🟨 Formation gagnée #{orig_game} → {rec_suit} ({card_pos} carte) présent au #{game_number}")
+            new_suffix = (
+                f"\n\n🟨 **Formation** : **{rec_disp}** ({card_pos} carte) → jeu **#{game_number}**\n"
+                f"✅ Présente — **Formation gagnée**"
+                f"{_FORMATION_LEGEND}"
+            )
         else:
-            # ❌ La carte recommandée est absente — on note quelle autre carte est sortie si applicable
-            note = f" (c'est la **{found_pos}** carte qui est sortie)" if found_pos else ""
-            logger.info(f"❌ Formation ratée #{orig_game} → {rec_suit} absent au #{game_number}{note}")
-            if active_pred:
-                active_pred['formation_suffix'] = (
-                    f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte) au jeu **#{game_number}**\n"
-                    f"❌ Absent{note}"
-                )
+            # 🔴 La carte recommandée est absente — formation perdue
+            note = f"\n_(c'est la {found_pos} carte qui est sortie)_" if found_pos else ""
+            logger.info(f"🔴 Formation perdue #{orig_game} → {rec_suit} absent au #{game_number}")
+            new_suffix = (
+                f"\n\n🔴 **Formation** : **{rec_disp}** ({card_pos} carte) → jeu **#{game_number}**\n"
+                f"❌ Absente — **Formation perdue**{note}"
+                f"{_FORMATION_LEGEND}"
+            )
+
+        if active_pred:
+            active_pred['formation_suffix'] = new_suffix
+            active_pred['formation_color'] = '🟨' if rec_suit in player_suits else '🔴'
+            # ── Mise à jour immédiate du message canal ─────────────────────────
+            _orig_suit = active_pred.get('suit', '')
+            _msg_id    = active_pred.get('message_id')
+            _ch2_id    = active_pred.get('channel2_message_id')
+            _ch3_id    = active_pred.get('channel3_message_id')
+            _ch4_id    = active_pred.get('channel4_message_id')
+            _ratrap    = active_pred.get('rattrapage', 0)
+            _cur_chk   = active_pred.get('current_check', orig_game)
+            _ver_games = active_pred.get('verified_games', [])
+
+            if _msg_id and _orig_suit:
+                _base_msg = format_prediction_message(
+                    orig_game, _orig_suit, 'en_cours', _cur_chk, _ver_games, _ratrap
+                ) + new_suffix
+
+                async def _edit_formation_result(
+                    base=_base_msg, mid=_msg_id,
+                    mid2=_ch2_id, mid3=_ch3_id, mid4=_ch4_id
+                ):
+                    ent = await resolve_channel(PREDICTION_CHANNEL_ID)
+                    if ent and mid:
+                        await safe_edit_message(ent, mid, base,
+                                                label=f"formation_result #{orig_game}")
+                    if PREDICTION_CHANNEL_ID2 and mid2:
+                        ent2 = await resolve_channel(PREDICTION_CHANNEL_ID2)
+                        if ent2:
+                            await safe_edit_message(ent2, mid2, base,
+                                                    label=f"formation_result2 #{orig_game}")
+                    if PREDICTION_CHANNEL_ID3 and mid3:
+                        ent3 = await resolve_channel(PREDICTION_CHANNEL_ID3)
+                        if ent3:
+                            await safe_edit_message(ent3, mid3, base,
+                                                    label=f"formation_result3 #{orig_game}")
+                    if PREDICTION_CHANNEL_ID4 and mid4:
+                        ent4 = await resolve_channel(PREDICTION_CHANNEL_ID4)
+                        if ent4:
+                            await safe_edit_message(ent4, mid4, base,
+                                                    label=f"formation_result4 #{orig_game}")
+
+                asyncio.ensure_future(_edit_formation_result())
+
         # Formation terminée — pas de rattrapage R1/R2
 
     # File de prédictions : envoie dès que la main joueur est complète (N+df match)
@@ -9271,7 +9326,8 @@ async def _trigger_formation_follow_up(original_game: int, original_suit: str, c
     next_game = check_game + 1
     formation_suffix = (
         f"\n\n♟️ **Formation** : **{rec_disp}** ({card_pos} carte du #**{check_game}**) → jeu **#{next_game}**\n"
-        "⏳ _Analyse..._"
+        "⏳ _Analyse en cours..._\n"
+        "_🟨 = Formation gagnée · 🔴 = Formation perdue_"
     )
     active_pred = pending_predictions.get(original_game)
     if active_pred:
@@ -9598,18 +9654,45 @@ async def _send_formation_simple_to_canal(heure: str = ''):
     heure_str = f" · {heure}" if heure else ''
     lines = [
         f"♟️ **Formation de mise**{heure_str}",
+        "━━━━━━━━━━━━━━━━━━━━",
         "",
-        "📌 **Conseil :**",
-        f"Si le bot envoie une prédiction et qu'elle ne reçoit pas son costume,",
-        f"misez sur la **{pos_label} carte** apparue au jeu prédit,",
-        f"au jeu suivant.",
-    ] + ex_lines
+        "📌 **C'est quoi la formation ?**",
+        "",
+        "Le bot joue en **rattrapage 2** : si le 1er jeu rate (R0),",
+        "il retente aux jeux R1 et R2.",
+        "",
+        "La formation est un **2ème coup joué en parallèle** :",
+        f"si le costume prédit est absent au jeu X,",
+        f"misez sur la **{pos_label} carte** apparue à ce même jeu,",
+        "au jeu suivant (X+1). **1 seul check, pas de rattrapage.**",
+        "",
+        "📊 **Comment lire le résultat dans la prédiction :**",
+        "",
+        "✅ Statut: 🟨2️⃣ GAGNÉ → prédiction gagnée + **formation gagnée**",
+        "✅ Statut: 🔴2️⃣ GAGNÉ → prédiction gagnée + **formation perdue**",
+        "❌ Statut: 🟨 PERDU  → prédiction perdue + **formation gagnée**",
+        "❌ Statut: 🔴 PERDU  → prédiction perdue + **formation perdue**",
+        "✅ Statut: ✅0️⃣ GAGNÉ → victoire directe, **aucune formation jouée**",
+    ] + ex_lines + [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "_⏱ Ce message disparaît dans 5 min_",
+    ]
 
     try:
         channel = await resolve_channel(PREDICTION_CHANNEL_ID)
         if channel:
-            await client.send_message(channel, "\n".join(lines), parse_mode='markdown')
+            msg = await client.send_message(channel, "\n".join(lines), parse_mode='markdown')
             logger.info(f"📢 Conseil formation simple envoyé au canal ({pos_label} carte recommandée)")
+            # Auto-suppression après 5 minutes
+            async def _auto_delete_formation(ch=channel, mid=msg.id):
+                await asyncio.sleep(300)
+                try:
+                    await client.delete_messages(ch, [mid])
+                    logger.info(f"🗑️ Message formation canal supprimé (5 min)")
+                except Exception:
+                    pass
+            asyncio.ensure_future(_auto_delete_formation())
     except Exception as e:
         logger.error(f"❌ _send_formation_simple_to_canal: {e}")
 

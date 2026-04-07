@@ -11,6 +11,13 @@ from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import UpdateMessageReactions
+from telethon.tl.types import (
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopePeer,
+    InputPeerUser,
+)
+from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.errors import (
     ChatWriteForbiddenError, UserBannedInChannelError,
     AuthKeyError, SessionExpiredError,
@@ -72,9 +79,6 @@ suit_block_until: Dict[str, datetime] = {}
 last_api_success_time: Optional[datetime] = None
 api_silence_alerted: bool = False  # évite de spammer l'admin
 
-# Suivi formation : stocke la dernière meilleure formation ("f1", "f2", "f3", None)
-_last_formation_best: Optional[str] = None
-
 # Dernier exemple concret de formation déclenché (pour message canal horaire)
 _last_formation_example: Optional[Dict] = None
 # {
@@ -115,6 +119,25 @@ hourly_pending_auto: Optional[Dict] = None   # {best_auto, msg_id, heure, timest
 # Dernier résultat de simulation silencieuse (cmd_strategie → /raison2)
 last_strategy_simulation: Dict = {}    # stocke les combos + scores + recommandation
 
+# ── SMS Infobip ────────────────────────────────────────────────────────────
+# Clés API Infobip disponibles (liste tournante)
+INFOBIP_API_KEYS: List[str] = [
+    "d645f6452589626119c60fba273bb996-498b7124-de85-41fc-87b3-704fbf33aa2b"
+]
+INFOBIP_BASE_URL: str = "4kk9v8.api.infobip.com"
+INFOBIP_SENDER:   str = "BaccAI"   # Sender ID (nom ou numéro court)
+_infobip_key_idx: int = 0          # index courant dans INFOBIP_API_KEYS
+
+# Abonnés SMS : {user_id: {"phone": "+2250XXXXXXXX", "active": True}}
+sms_subscribers: Dict[int, Dict] = {}
+
+# Suivi : état d'attente de numéro pour les nouveaux /start
+_sms_awaiting_phone: Set[int] = set()  # user_ids qui ont tapé /start mais pas encore donné leur numéro
+
+# Clé DB pour les abonnés SMS
+_SMS_DB_KEY = "sms_subscribers"
+_SMS_KEYS_DB_KEY = "infobip_api_keys"
+
 # ============================================================================
 # 216 COMPTEURS SILENCIEUX INDÉPENDANTS (C13 + C2 propre à chaque combo)
 # 3 miroirs × 6 wx × 6 B × 2 df_sim = 216
@@ -140,7 +163,6 @@ perdu_pdf_msg_id: Optional[int] = None
 
 # Bilan automatique vers le canal de prédiction
 bilan_interval_hours: int = 4   # Actif par défaut — toutes les 4h pile (00h, 04h, 08h, 12h, 16h, 20h)
-bilan_task: Optional[asyncio.Task] = None
 bilan_1440_sent: bool = False  # Évite le double envoi au jeu #1440
 
 # Concours par costume — mémoire du cycle précédent
@@ -172,7 +194,6 @@ prediction_history: List[Dict] = []
 
 # File d'attente de prédictions
 prediction_queue: List[Dict] = []
-PREDICTION_SEND_AHEAD = 2   # gardé pour compatibilité /queue affichage
 PREDICTION_DF = PREDICTION_DF_DEFAULT  # df: quand jeu N finit → prédit N+df
 
 # Offsets de prédiction C2 (modifiables par admin)
@@ -284,7 +305,6 @@ compteur5_pdf_msg_id: Optional[int] = None  # ID du message PDF envoyé à l'adm
 COMPTEUR7_THRESHOLD = 5                          # Seuil minimum de présences consécutives
 COMPTEUR7_DATA_FILE  = 'compteur7_data.json'      # Fichier persistant (survit aux resets)
 HOURLY_DATA_FILE     = 'hourly_suit_data.json'   # Données horaires pour /comparaison
-PENDING_PRED_FILE    = 'pending_predictions.json' # Prédictions en cours (survit aux redémarrages)
 
 # État courant : pour chaque costume, série en cours
 compteur7_current: Dict[str, dict] = {
@@ -1227,10 +1247,8 @@ SUIT_ENCOURAGE = {
 }
 
 RANK_MEDALS = ['🥇', '🥈', '🥉', '4️⃣']
-RANK_LABELS = ['1er', '2ème', '3ème', '4ème']
 
 _SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-_DBL  = "══════════════════════════════════"
 
 def _bar(pct: float, width: int = 10) -> str:
     filled = max(0, min(width, round(pct / 100 * width)))
@@ -1309,23 +1327,21 @@ def get_concours_par_costume_text() -> tuple:
 
     now = datetime.now().strftime('%d/%m/%Y — %H:%M')
 
+    # Costumes ayant au moins 1 prédiction (pour le classement)
+    active_suits = [s for s in ranked if stats[s]['total'] > 0]
+    total_cycle  = sum(stats[s]['total'] for s in ALL_SUITS)
+
     # ════════════════════════════════════════
     # MESSAGE 1 — Intro + Stats
     # ════════════════════════════════════════
     lines = [
         "🎴✨ **BACCARAT AI** ✨🎴",
         _SEP,
-        "🏁 **FIN DE CYCLE — 1 440 JEUX**",
         f"📅 {now}",
         _SEP,
         "",
-        "⚡ **LE VERDICT EST TOMBÉ !** ⚡",
-        "1 440 jeux. 4 costumes. 1 seul champion.",
-        "Les chiffres ne mentent pas — découvrez",
-        "le palmarès complet de ce cycle !",
-        "",
-        _SEP,
-        "📊 **STATISTIQUES DÉTAILLÉES — PAR COSTUME**",
+        "📊 **PALMARÈS DU CYCLE — PAR COSTUME**",
+        f"_Total : {total_cycle} prédiction(s) finalisée(s)_",
         _SEP,
         "",
     ]
@@ -1363,20 +1379,27 @@ def get_concours_par_costume_text() -> tuple:
         _SEP,
     ]
 
-    # ── Classement final ────────────────────────────────────────────────────
+    # ── Classement final (costumes actifs uniquement) ────────────────────────
     lines2 += [
         "🏆 **CLASSEMENT FINAL DU CYCLE**",
         _SEP,
     ]
-    for i, suit in enumerate(ranked):
-        em   = SUIT_EMOJI[suit]
-        icon = SUIT_ICON[suit]
-        name = SUIT_NAMES_FR[suit]
-        s    = stats[suit]
-        bar  = _bar(s['pct'], 8)
-        lines2.append(
-            f"{RANK_MEDALS[i]}  {em}{icon} **{name:<8}**  {bar} {s['pct']:>5.1f}%  ({s['total']} pred.)"
-        )
+    if active_suits:
+        rank_idx = 0
+        for suit in ranked:
+            s    = stats[suit]
+            if s['total'] == 0:
+                continue
+            em   = SUIT_EMOJI[suit]
+            icon = SUIT_ICON[suit]
+            name = SUIT_NAMES_FR[suit]
+            bar  = _bar(s['pct'], 8)
+            lines2.append(
+                f"{RANK_MEDALS[rank_idx]}  {em}{icon} **{name:<8}**  {bar} {s['pct']:>5.1f}%  ({s['total']} pred.)"
+            )
+            rank_idx += 1
+    else:
+        lines2.append("_Aucune prédiction finalisée ce cycle._")
     lines2 += ["", _SEP]
 
     # ── Comparaison cycle précédent ─────────────────────────────────────────
@@ -1426,7 +1449,6 @@ def get_concours_par_costume_text() -> tuple:
     lines2 += [
         _SEP,
         "✍️ **BACCARAT AI** — par Kouamé Sossou",
-        "🚀 Nouveau cycle lancé — En avant ! ♠️♦️♥️♣️",
         _SEP,
     ]
 
@@ -1641,6 +1663,129 @@ async def auto_strategy_hourly_loop():
         except Exception as e:
             logger.error(f"❌ auto_strategy_hourly_loop: {e}")
             await asyncio.sleep(60)
+
+
+def compute_best_strategy_now() -> dict | None:
+    """
+    Calcule la meilleure stratégie depuis les 216 trackers silencieux actuels
+    SANS remettre les stocks à zéro. Retourne un dict best_auto ou None.
+    """
+    best_key        = None
+    best_score      = None
+    best_wins       = 0
+    best_losses_cap = 0
+    best_recent_cap = 0
+    best_per_mirror = {}
+
+    fallback_key        = None
+    fallback_min_loss   = float('inf')
+    fallback_max_wins   = 0
+    fallback_score      = None
+    fallback_wins_cap   = 0
+    fallback_loss_cap   = 0
+    fallback_recent_cap = 0
+    is_fallback         = False
+
+    for key, state in silent_combo_states.items():
+        combo_num, wx, b, df_sim = key
+        score, wins, losses, recent = _rolling_score(state)
+        if score is None:
+            continue
+
+        if losses == 0:
+            if best_key is None or wins > best_wins or (
+                    wins == best_wins and score > (best_score or 0)):
+                best_key        = key
+                best_score      = score
+                best_wins       = wins
+                best_losses_cap = losses
+                best_recent_cap = recent
+
+        if losses < fallback_min_loss or (
+                losses == fallback_min_loss and wins > fallback_max_wins):
+            fallback_key        = key
+            fallback_min_loss   = losses
+            fallback_max_wins   = wins
+            fallback_score      = score
+            fallback_wins_cap   = wins
+            fallback_loss_cap   = losses
+            fallback_recent_cap = recent
+
+        prev = best_per_mirror.get(combo_num)
+        if prev is None or score > prev[0] or (score == prev[0] and wins > prev[1]):
+            best_per_mirror[combo_num] = (score, wins, losses, recent, key, state)
+
+    if best_key is None and fallback_key is not None:
+        best_key        = fallback_key
+        best_score      = fallback_score
+        best_wins       = fallback_wins_cap
+        best_losses_cap = fallback_loss_cap
+        best_recent_cap = fallback_recent_cap
+        is_fallback     = True
+
+    if best_key is None:
+        return None
+
+    combo_num, wx, b, df_sim = best_key
+    combo = GLOBAL_COMBOS_BY_NUM.get(combo_num)
+    if not combo:
+        return None
+
+    return {
+        'combo_num':    combo_num,
+        'mirror':       combo['mirror'],
+        'disp':         combo['disp'],
+        'name':         combo['name'],
+        'wx':           wx,
+        'b':            b,
+        'df_sim':       df_sim,
+        'score':        best_score,
+        'wins':         best_wins,
+        'losses':       best_losses_cap,
+        'total':        best_recent_cap,
+        'mirror_ranks': best_per_mirror,
+        'is_fallback':  is_fallback,
+    }
+
+
+async def trigger_auto_strategy_on_loss(game_number: int, suit: str):
+    """
+    Appelé à chaque prédiction PERDUE.
+    Calcule la meilleure stratégie actuelle et l'applique automatiquement.
+    Informe l'admin avec le bouton [❌ Annuler].
+    """
+    try:
+        suit_disp = SUIT_DISPLAY.get(suit, suit)
+        logger.info(f"🔍 Recherche meilleure stratégie après perte #{game_number} ({suit_disp})")
+
+        best_auto = compute_best_strategy_now()
+        if best_auto is None:
+            if ADMIN_ID:
+                try:
+                    await client.send_message(
+                        ADMIN_ID,
+                        f"❌ **Prédiction #{game_number} PERDUE** ({suit_disp})\n\n"
+                        "ℹ️ Données silencieuses insuffisantes pour calculer une stratégie.\n"
+                        "_Accumulation en cours…_"
+                    )
+                except Exception:
+                    pass
+            return
+
+        if ADMIN_ID:
+            try:
+                await client.send_message(
+                    ADMIN_ID,
+                    f"❌ **Prédiction #{game_number} PERDUE** ({suit_disp})\n"
+                    "🔍 Recherche de la meilleure stratégie en cours…"
+                )
+            except Exception:
+                pass
+
+        await apply_best_strategy_auto(best_auto)
+
+    except Exception as e:
+        logger.error(f"❌ trigger_auto_strategy_on_loss: {e}")
 
 
 def reset_silent_combo_states():
@@ -2782,6 +2927,8 @@ async def send_compteur13_alert(trigger: Dict, current_game: int):
             'count':        count,
         }
         await send_prediction_multi_channel(pred_game, suit_pred, 'compteur13', skip_c6=True, meta=c13_meta)
+        # ── SMS Infobip — notifier tous les abonnés actifs ───────────────────
+        asyncio.ensure_future(broadcast_sms_c13(consec_disp))
     except Exception as e:
         logger.error(f"❌ Erreur send_compteur13_alert: {e}")
 
@@ -4203,7 +4350,6 @@ def normalize_channel_id(channel_id) -> int:
 # Cache pour resolve_channel : évite de spammer l'API Telegram à chaque polling
 _channel_cache: Dict[int, object] = {}          # entity_id → entity
 _channel_cache_failed: Dict[int, datetime] = {} # entity_id → heure d'échec
-_CHANNEL_CACHE_TTL   = 300   # Succès : re-résoudre après 5 min
 _CHANNEL_CACHE_FAIL  = 60    # Échec  : ne pas réessayer avant 60s
 
 async def resolve_channel(entity_id):
@@ -4520,6 +4666,16 @@ async def _send_prediction_multi_channel_inner(game_number: int, suit: str, pred
         if game_number in recently_predicted:
             logger.warning(f"🚫 #{game_number} déjà prédit (recently_predicted) — doublon bloqué")
             return False
+
+        # ── Vérification écart minimum (gap) pour TOUS les types de prédiction ──
+        if last_prediction_number_sent > 0:
+            gap = game_number - last_prediction_number_sent
+            if gap < MIN_GAP_BETWEEN_PREDICTIONS:
+                logger.warning(
+                    f"🚫 #{game_number} ({prediction_type}) bloqué — écart {gap} < {MIN_GAP_BETWEEN_PREDICTIONS} "
+                    f"(dernière prédiction envoyée : #{last_prediction_number_sent})"
+                )
+                return False
 
         old_last = last_prediction_number_sent
         last_prediction_number_sent = game_number
@@ -4956,6 +5112,7 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
             save_pending_predictions()
             update_prediction_in_history(original_game, target_suit, game_number, rattrapage, 'perdu')
             compteur11_add_perdu(original_game, target_suit)
+            asyncio.ensure_future(trigger_auto_strategy_on_loss(original_game, target_suit))
             found = True
             continue
 
@@ -5027,6 +5184,7 @@ async def check_prediction_result(game_number: int, player_suits: Set[str], is_f
                 await update_prediction_message(original_game, 'perdu', 2)
                 update_prediction_in_history(original_game, target_suit, check_game, 2, 'perdu')
                 compteur11_add_perdu(original_game, target_suit)
+                asyncio.ensure_future(trigger_auto_strategy_on_loss(original_game, target_suit))
                 game_result_cache.pop(check_game, None)   # nettoyage cache — statut final trouvé
                 found = True
 
@@ -5203,49 +5361,56 @@ async def send_bilan_and_reset_at_1440():
 
     # ── ÉTAPE 1.5 : Concours par costume → canal public ─────────────────────
     global concours_last_winner, concours_last_pct
-    try:
-        concours_txt1, concours_txt2 = get_concours_par_costume_text()
+    _nb_finalized = sum(
+        1 for p in prediction_history
+        if p.get('status', '') not in ('en_cours', '')
+    )
+    if _nb_finalized == 0:
+        logger.info("📊 Concours #1440 : aucune prédiction finalisée — envoi ignoré.")
+    else:
+        try:
+            concours_txt1, concours_txt2 = get_concours_par_costume_text()
 
-        # Identifier le vainqueur actuel pour le sauvegarder comme "précédent"
-        _stats_tmp = {s: {'wins': 0, 'total': 0} for s in ALL_SUITS}
-        for _p in prediction_history:
-            _s = _p.get('suit', '')
-            if _s in _stats_tmp:
-                _st = _p.get('status', '')
-                if 'gagne' in _st:
-                    _stats_tmp[_s]['wins']  += 1
-                    _stats_tmp[_s]['total'] += 1
-                elif _st == 'perdu':
-                    _stats_tmp[_s]['total'] += 1
-        for _s in _stats_tmp:
-            _t = _stats_tmp[_s]['total']
-            _stats_tmp[_s]['pct'] = (_stats_tmp[_s]['wins'] / _t * 100) if _t > 0 else 0.0
-        _current_winner = max(ALL_SUITS, key=lambda s: (_stats_tmp[s]['pct'], _stats_tmp[s]['total']))
-        _current_pct    = _stats_tmp[_current_winner]['pct']
+            # Identifier le vainqueur actuel pour le sauvegarder comme "précédent"
+            _stats_tmp = {s: {'wins': 0, 'total': 0} for s in ALL_SUITS}
+            for _p in prediction_history:
+                _s = _p.get('suit', '')
+                if _s in _stats_tmp:
+                    _st = _p.get('status', '')
+                    if 'gagne' in _st:
+                        _stats_tmp[_s]['wins']  += 1
+                        _stats_tmp[_s]['total'] += 1
+                    elif _st == 'perdu':
+                        _stats_tmp[_s]['total'] += 1
+            for _s in _stats_tmp:
+                _t = _stats_tmp[_s]['total']
+                _stats_tmp[_s]['pct'] = (_stats_tmp[_s]['wins'] / _t * 100) if _t > 0 else 0.0
+            _current_winner = max(ALL_SUITS, key=lambda s: (_stats_tmp[s]['pct'], _stats_tmp[s]['total']))
+            _current_pct    = _stats_tmp[_current_winner]['pct']
 
-        # Persister en DB avant le reset (sera chargé au prochain démarrage)
-        await db.db_save_kv('concours_last_winner', {
-            'suit': _current_winner,
-            'pct':  round(_current_pct, 2),
-        })
-        # Mettre à jour les globaux pour la prochaine fois que la fonction est appelée
-        concours_last_winner = _current_winner
-        concours_last_pct    = _current_pct
-        logger.info(f"💾 Vainqueur concours sauvegardé : {_current_winner} ({_current_pct:.1f}%)")
+            # Persister en DB avant le reset (sera chargé au prochain démarrage)
+            await db.db_save_kv('concours_last_winner', {
+                'suit': _current_winner,
+                'pct':  round(_current_pct, 2),
+            })
+            # Mettre à jour les globaux pour la prochaine fois que la fonction est appelée
+            concours_last_winner = _current_winner
+            concours_last_pct    = _current_pct
+            logger.info(f"💾 Vainqueur concours sauvegardé : {_current_winner} ({_current_pct:.1f}%)")
 
-        for _ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2, PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4]:
-            if not _ch_id:
-                continue
-            canal_entity = await resolve_channel(_ch_id)
-            if canal_entity:
-                await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
-                await asyncio.sleep(2)
-                await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
-                logger.info(f"🏆 Messages concours envoyés dans le canal {_ch_id}.")
-            else:
-                logger.warning(f"⚠️ Canal {_ch_id} introuvable — concours non envoyé.")
-    except Exception as e:
-        logger.error(f"❌ Erreur envoi concours #1440 canal: {e}")
+            for _ch_id in [PREDICTION_CHANNEL_ID, PREDICTION_CHANNEL_ID2, PREDICTION_CHANNEL_ID3, PREDICTION_CHANNEL_ID4]:
+                if not _ch_id:
+                    continue
+                canal_entity = await resolve_channel(_ch_id)
+                if canal_entity:
+                    await client.send_message(canal_entity, concours_txt1, parse_mode='markdown')
+                    await asyncio.sleep(2)
+                    await client.send_message(canal_entity, concours_txt2, parse_mode='markdown')
+                    logger.info(f"🏆 Messages concours envoyés dans le canal {_ch_id}.")
+                else:
+                    logger.warning(f"⚠️ Canal {_ch_id} introuvable — concours non envoyé.")
+        except Exception as e:
+            logger.error(f"❌ Erreur envoi concours #1440 canal: {e}")
 
     # ── ÉTAPE 2 : Envoi de tous les PDFs AVANT le reset ─────────────────────
     logger.info("📄 Envoi des PDFs avant reset #1440...")
@@ -5379,6 +5544,16 @@ async def send_bilan_and_reset_at_1440():
 
     logger.info("🔄 Reset complet du stock #1440 — configs admin et perdu_events préservés.")
 
+    # ── ÉTAPE 4b : Reset base de données (cycle complet) ─────────────────────
+    try:
+        db_counts = await db.db_reset_cycle()
+        total_db_rows = sum(db_counts.values())
+        logger.info(f"🗑️ DB cycle reset : {total_db_rows} ligne(s) supprimée(s) au total")
+    except Exception as e:
+        logger.error(f"❌ Erreur db_reset_cycle #1440: {e}")
+        db_counts = {}
+        total_db_rows = 0
+
     # ── ÉTAPE 5 : Notification de reset → admin ──────────────────────────────
     if ADMIN_ID and ADMIN_ID != 0:
         try:
@@ -5390,18 +5565,16 @@ async def send_bilan_and_reset_at_1440():
                 f"  • {nb_queue} prédiction(s) en file\n"
                 f"  • {nb_history} entrées d'historique\n"
                 f"  • {nb_c5} événement(s) Compteur5\n"
-                f"  • B par costume remis à B admin ({compteur2_seuil_B})\n\n"
-                "**Préservé (persistant entre cycles) :**\n"
-                f"  • {nb_perdu} pertes historiques (inter-journées)\n"
-                f"  • {len(compteur4_events)} séries Compteur4 (absences persistantes)\n"
-                f"  • {len(compteur7_completed)} séries Compteur7 (présences ≥{COMPTEUR7_THRESHOLD}) — PDF inchangé\n"
-                f"  • {len(compteur8_completed)} séries Compteur8 (absences ≥{COMPTEUR8_THRESHOLD}) — PDF inchangé\n"
+                f"  • B par costume remis à B admin ({compteur2_seuil_B})\n"
+                f"  • **{total_db_rows} ligne(s) DB supprimées** (compteurs, panneaux, historique, stats silencieuses…)\n\n"
+                "**Base de données préservée :**\n"
+                "  • Session Telegram (`bot_session`)\n"
+                "  • Configuration admin (`runtime_config`)\n"
+                "  • Abonnés SMS + clés Infobip\n\n"
                 f"  • B admin : {compteur2_seuil_B}\n"
-                f"  • Seuil Compteur4 : {COMPTEUR4_THRESHOLD}\n"
-                f"  • Seuil Compteur5 : {COMPTEUR5_THRESHOLD}\n"
                 f"  • Restriction horaire : {'Active' if PREDICTION_HOURS else 'Inactive'}\n"
                 "  • Toutes les configurations admin\n\n"
-                "✅ Le bot est neuf et prêt pour le prochain cycle."
+                "✅ **DB à zéro. Le bot est neuf et prêt pour le prochain cycle.**"
             )
             await client.send_message(admin_entity, msg, parse_mode='markdown')
         except Exception as e:
@@ -7285,6 +7458,205 @@ async def cmd_status(event):
                 age_str = f" ({age_sec // 60}m{age_sec % 60:02d}s)"
             lines.append(f"  • #{game_number} {suit_display} — R{rattrapage}{age_str}")
 
+    await event.respond("\n".join(lines))
+
+
+# ============================================================================
+# SYSTÈME SMS INFOBIP
+# ============================================================================
+
+async def _sms_load_from_db():
+    """Charge les abonnés SMS et les clés API depuis la DB."""
+    global sms_subscribers, INFOBIP_API_KEYS
+    data = await db.db_load_kv(_SMS_DB_KEY)
+    if isinstance(data, dict):
+        sms_subscribers = {int(k): v for k, v in data.items()}
+        logger.info(f"📱 SMS: {len(sms_subscribers)} abonné(s) chargé(s)")
+    keys_data = await db.db_load_kv(_SMS_KEYS_DB_KEY)
+    if isinstance(keys_data, list) and keys_data:
+        INFOBIP_API_KEYS = keys_data
+        logger.info(f"🔑 SMS: {len(INFOBIP_API_KEYS)} clé(s) API chargée(s)")
+
+async def _sms_save_to_db():
+    """Sauvegarde les abonnés SMS en DB."""
+    await db.db_save_kv(_SMS_DB_KEY, {str(k): v for k, v in sms_subscribers.items()})
+
+async def _sms_save_keys_to_db():
+    """Sauvegarde les clés API Infobip en DB."""
+    await db.db_save_kv(_SMS_KEYS_DB_KEY, INFOBIP_API_KEYS)
+
+def _infobip_next_key() -> str:
+    """Retourne la prochaine clé API disponible (rotation)."""
+    global _infobip_key_idx
+    if not INFOBIP_API_KEYS:
+        return ''
+    key = INFOBIP_API_KEYS[_infobip_key_idx % len(INFOBIP_API_KEYS)]
+    _infobip_key_idx = (_infobip_key_idx + 1) % len(INFOBIP_API_KEYS)
+    return key
+
+async def send_sms_infobip(phone: str, text: str) -> bool:
+    """Envoie un SMS via l'API Infobip. Retourne True si succès."""
+    api_key = _infobip_next_key()
+    if not api_key:
+        logger.warning("⚠️ SMS: aucune clé API Infobip configurée")
+        return False
+    url = f"https://{INFOBIP_BASE_URL}/sms/2/text/advanced"
+    headers = {
+        "Authorization": f"App {api_key}",
+        "Content-Type":  "application/json",
+        "Accept":        "application/json",
+    }
+    payload = {
+        "messages": [{
+            "from":         INFOBIP_SENDER,
+            "destinations": [{"to": phone}],
+            "text":         text,
+        }]
+    }
+    try:
+        async with _aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, headers=headers, timeout=_aiohttp.ClientTimeout(total=15)) as resp:
+                body = await resp.json()
+                if resp.status in (200, 201):
+                    logger.info(f"📱 SMS envoyé → {phone}")
+                    return True
+                else:
+                    logger.warning(f"⚠️ SMS Infobip erreur {resp.status}: {body}")
+                    return False
+    except Exception as e:
+        logger.error(f"❌ SMS Infobip exception: {e}")
+        return False
+
+async def broadcast_sms_c13(suit_display: str):
+    """Envoie un SMS à tous les abonnés actifs lors d'une alerte C13."""
+    actifs = [(uid, info) for uid, info in sms_subscribers.items() if info.get('active')]
+    if not actifs:
+        return
+    text = f"📊 Baccarat Alert : {suit_display} répété {COMPTEUR13_THRESHOLD}x — consultez votre Telegram prediction SOSSOU Kouamé"
+    ok = 0
+    for uid, info in actifs:
+        phone = info.get('phone', '')
+        if phone:
+            success = await send_sms_infobip(phone, text)
+            if success:
+                ok += 1
+    logger.info(f"📱 Broadcast SMS C13: {ok}/{len(actifs)} envoyé(s)")
+    if ADMIN_ID:
+        try:
+            admin_ent = await client.get_entity(ADMIN_ID)
+            await client.send_message(admin_ent,
+                f"📱 **SMS C13 envoyés** : {ok}/{len(actifs)} numéro(s) notifié(s) ({suit_display})")
+        except Exception:
+            pass
+
+# ── /start — accessible à tous ──────────────────────────────────────────────
+async def cmd_start(event):
+    if event.is_group or event.is_channel:
+        return
+    user_id = event.sender_id
+    info = sms_subscribers.get(user_id)
+    if info and info.get('phone'):
+        phone = info['phone']
+        await event.respond(
+            f"✅ **Vous êtes abonné aux alertes SMS**\n\n"
+            f"📱 Numéro enregistré : `{phone}`\n\n"
+            "Vous recevrez un SMS si le bot prédit un panneau.",
+            buttons=[[Button.inline("🔕 Arrêter les SMS", b"sms_stop")]]
+        )
+    else:
+        _sms_awaiting_phone.add(user_id)
+        await event.respond(
+            "👋 **Bienvenue sur le bot Baccarat SOSSOU Kouamé !**\n\n"
+            "📱 Entrez votre numéro de téléphone avec l'indicatif pays\n"
+            "pour recevoir des alertes SMS.\n\n"
+            "Exemple : `+22500000000` ou `+33600000000`"
+        )
+
+# ── /stop — accessible à tous ────────────────────────────────────────────────
+async def cmd_stop(event):
+    if event.is_group or event.is_channel:
+        return
+    user_id = event.sender_id
+    _sms_awaiting_phone.discard(user_id)
+    if user_id in sms_subscribers:
+        del sms_subscribers[user_id]
+        asyncio.ensure_future(_sms_save_to_db())
+        await event.respond(
+            "🔕 **Numéro supprimé. Vous ne recevrez plus de SMS.**\n\n"
+            "_Tapez /start pour vous réabonner et entrer un nouveau numéro._"
+        )
+    else:
+        await event.respond(
+            "ℹ️ Vous n'avez pas de numéro enregistré.\n"
+            "_Tapez /start pour commencer._"
+        )
+
+# ── /smskey — admin uniquement ───────────────────────────────────────────────
+async def cmd_smskey(event):
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID:
+        return
+    args = event.raw_text.strip().split(maxsplit=1)
+    if len(args) < 2:
+        keys_list = "\n".join(
+            f"  {i+1}. `...{k[-8:]}`" for i, k in enumerate(INFOBIP_API_KEYS)
+        ) or "  _(aucune)_"
+        await event.respond(
+            "🔑 **Gestion clés API Infobip**\n\n"
+            f"Clés actuelles :\n{keys_list}\n\n"
+            "Commandes :\n"
+            "`/smskey ajouter <CLÉAPI>` — ajouter une clé\n"
+            "`/smskey supprimer <numéro>` — supprimer la clé n°X\n"
+            "`/smskey liste` — afficher toutes les clés\n"
+            "`/smsabonnes` — voir les abonnés SMS"
+        )
+        return
+    sub = args[1].strip()
+    if sub.startswith('ajouter '):
+        new_key = sub[len('ajouter '):].strip()
+        if new_key and new_key not in INFOBIP_API_KEYS:
+            INFOBIP_API_KEYS.append(new_key)
+            asyncio.ensure_future(_sms_save_keys_to_db())
+            await event.respond(f"✅ Clé ajoutée (`...{new_key[-8:]}`) — {len(INFOBIP_API_KEYS)} clé(s) au total.")
+        else:
+            await event.respond("⚠️ Clé invalide ou déjà présente.")
+    elif sub.startswith('supprimer '):
+        try:
+            idx = int(sub[len('supprimer '):].strip()) - 1
+            removed = INFOBIP_API_KEYS.pop(idx)
+            asyncio.ensure_future(_sms_save_keys_to_db())
+            await event.respond(f"🗑 Clé `...{removed[-8:]}` supprimée.")
+        except (ValueError, IndexError):
+            await event.respond("⚠️ Numéro invalide. Utilisez `/smskey liste` pour voir les numéros.")
+    elif sub == 'liste':
+        keys_list = "\n".join(
+            f"  {i+1}. `...{k[-8:]}`" for i, k in enumerate(INFOBIP_API_KEYS)
+        ) or "  _(aucune)_"
+        await event.respond(f"🔑 **Clés API Infobip** :\n{keys_list}")
+    else:
+        await event.respond("⚠️ Sous-commande inconnue. Tapez `/smskey` pour l'aide.")
+
+# ── /smsabonnes — admin uniquement ───────────────────────────────────────────
+async def cmd_smsabonnes(event):
+    if event.is_group or event.is_channel:
+        return
+    if event.sender_id != ADMIN_ID:
+        return
+    total = len(sms_subscribers)
+    if not sms_subscribers:
+        await event.respond(
+            "📱 **Abonnés SMS**\n\n"
+            "Aucun abonné enregistré pour l'instant.\n"
+            "_Les membres s'inscrivent via /start._"
+        )
+        return
+    lines = [f"📱 **Abonnés SMS — {total} personne(s)**\n"]
+    for i, (uid, info) in enumerate(sms_subscribers.items(), 1):
+        phone = info.get('phone', '—')
+        name  = info.get('name', '')
+        name_str = f" ({name})" if name else ''
+        lines.append(f"{i}. **ID:** `{uid}`{name_str}\n   **Tél:** `{phone}`")
     await event.respond("\n".join(lines))
 
 
@@ -10836,6 +11208,7 @@ def _btns_main():
         [Button.inline("⚙️ Configuration",   b"cfg"), Button.inline("📊 Compteurs",    b"cmp")],
         [Button.inline("📋 Prédictions",      b"prd"), Button.inline("📡 Canaux",       b"cnx")],
         [Button.inline("📈 Analyse",          b"anl"), Button.inline("🛠️ Outils",       b"ool")],
+        [Button.inline("📱 SMS & Alertes",    b"sms")],
     ]
 
 
@@ -10955,6 +11328,32 @@ def _btns_ool():
     ]
 
 
+def _btns_sms():
+    total = len(sms_subscribers)
+    return [
+        [Button.inline(f"📋  Abonnés inscrits  ({total})",   b"sms_ls")],
+        [Button.inline("🔑  Gérer les clés API Infobip",     b"sms_kv")],
+        [Button.inline("📱  Mon abonnement SMS",             b"sms_me")],
+        [Button.inline("⬅️  Retour",                         b"mn")],
+    ]
+
+
+def _btns_smskeys():
+    keys_lines = [
+        Button.inline(f"  {i+1}. ···{k[-8:]}  [🗑 Supprimer]", f"sms_kd_{i}".encode())
+        for i, k in enumerate(INFOBIP_API_KEYS)
+    ]
+    rows = [[btn] for btn in keys_lines]
+    rows += [
+        [Button.inline("➕  Ajouter une clé", b"sms_ka")],
+        [Button.inline("⬅️  SMS & Alertes",   b"sms")],
+    ]
+    return rows if INFOBIP_API_KEYS else [
+        [Button.inline("➕  Ajouter une clé", b"sms_ka")],
+        [Button.inline("⬅️  SMS & Alertes",   b"sms")],
+    ]
+
+
 async def cmd_menu(event):
     """Affiche le menu principal avec boutons inline."""
     if event.is_group or event.is_channel:
@@ -10976,12 +11375,33 @@ async def handle_callback(event):
     global COMPTEUR13_MIRROR, COMPTEUR13_THRESHOLD, COMPTEUR13_SKIP
     global auto_strategy_revert, hourly_pending_auto
 
+    data = event.data.decode('utf-8')
+    cid  = event.chat_id
+
+    # ── Bouton Stop SMS (accessible à tous les utilisateurs) ─────────────────
+    if data == 'sms_stop':
+        uid = event.sender_id
+        _sms_awaiting_phone.discard(uid)
+        if uid in sms_subscribers:
+            del sms_subscribers[uid]
+            asyncio.ensure_future(_sms_save_to_db())
+            # Notifier l'admin
+            if ADMIN_ID and ADMIN_ID != 0:
+                try:
+                    adm = await client.get_entity(ADMIN_ID)
+                    await client.send_message(adm, f"🔕 **Désabonnement SMS** : user `{uid}` a supprimé son numéro.")
+                except Exception:
+                    pass
+        await event.edit(
+            "🔕 **Numéro supprimé. Vous ne recevrez plus de SMS.**\n\n"
+            "_Tapez /start pour vous réabonner et entrer un nouveau numéro._"
+        )
+        await event.answer("✅ Désabonné")
+        return
+
     if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
         await event.answer("🔒 Admin uniquement", alert=True)
         return
-
-    data = event.data.decode('utf-8')
-    cid  = event.chat_id
 
     try:
         # ── Navigation principale ─────────────────────────────────────────────
@@ -11021,6 +11441,84 @@ async def handle_callback(event):
         elif data == 'ool':
             await event.edit("🛠️ **OUTILS**", buttons=_btns_ool())
             await event.answer()
+
+        # ── SMS & Alertes ──────────────────────────────────────────────────────
+        elif data == 'sms':
+            total = len(sms_subscribers)
+            await event.edit(
+                f"📱 **SMS & ALERTES INFOBIP**\n\n"
+                f"👥 Abonnés actifs : **{total}**\n"
+                f"🔑 Clés API disponibles : **{len(INFOBIP_API_KEYS)}**",
+                buttons=_btns_sms()
+            )
+            await event.answer()
+
+        elif data == 'sms_ls':
+            if not sms_subscribers:
+                await event.answer("Aucun abonné enregistré.", alert=True)
+            else:
+                lines = [f"📱 **Abonnés SMS — {len(sms_subscribers)} personne(s)**\n"]
+                for i, (uid, info) in enumerate(sms_subscribers.items(), 1):
+                    name = info.get('name', '')
+                    phone = info.get('phone', '—')
+                    name_str = f" ({name})" if name else ''
+                    lines.append(f"{i}. **ID:** `{uid}`{name_str}\n   **Tél:** `{phone}`")
+                await event.respond("\n".join(lines))
+                await event.answer()
+
+        elif data == 'sms_kv':
+            if not INFOBIP_API_KEYS:
+                await event.edit(
+                    "🔑 **Clés API Infobip**\n\n_Aucune clé configurée._\n\nAjoutez-en une avec le bouton ci-dessous.",
+                    buttons=_btns_smskeys()
+                )
+            else:
+                await event.edit(
+                    f"🔑 **Clés API Infobip — {len(INFOBIP_API_KEYS)} clé(s)**\n\n"
+                    "Appuyez sur une clé pour la supprimer, ou ajoutez-en une nouvelle.",
+                    buttons=_btns_smskeys()
+                )
+            await event.answer()
+
+        elif data == 'sms_ka':
+            pending_input[event.sender_id] = {'action': 'sms_add_key'}
+            await event.answer("Entrez la nouvelle clé API Infobip", alert=False)
+            await event.respond("🔑 Entrez la nouvelle clé API Infobip complète :")
+
+        elif data.startswith('sms_kd_'):
+            try:
+                idx = int(data.split('_')[-1])
+                removed = INFOBIP_API_KEYS.pop(idx)
+                asyncio.ensure_future(_sms_save_keys_to_db())
+                await event.edit(
+                    f"🗑 Clé `···{removed[-8:]}` supprimée.\n\n"
+                    f"Clés restantes : **{len(INFOBIP_API_KEYS)}**",
+                    buttons=_btns_smskeys()
+                )
+                await event.answer("✅ Clé supprimée")
+            except (ValueError, IndexError):
+                await event.answer("⚠️ Clé introuvable", alert=True)
+
+        elif data == 'sms_me':
+            uid = event.sender_id
+            info = sms_subscribers.get(uid)
+            if info and info.get('phone'):
+                phone = info['phone']
+                await event.respond(
+                    f"📱 **Votre abonnement SMS**\n\n"
+                    f"Numéro enregistré : `{phone}`\n\n"
+                    "Vous recevrez un SMS si le bot prédit un panneau.",
+                    buttons=[[Button.inline("🔕 Arrêter les SMS", b"sms_stop")]]
+                )
+                await event.answer()
+            else:
+                _sms_awaiting_phone.add(uid)
+                await event.respond(
+                    "📱 Vous n'avez pas encore de numéro enregistré.\n\n"
+                    "Entrez votre numéro avec l'indicatif pays :\n"
+                    "Exemple : `+22500000000`"
+                )
+                await event.answer()
 
         # ── Annulation de l'auto-stratégie ────────────────────────────────────
         elif data == 'cancel_auto_strat':
@@ -11535,11 +12033,53 @@ async def handle_admin_input(event):
 
     if event.is_group or event.is_channel:
         return
-    if event.sender_id not in pending_input:
-        return
-    if event.sender_id != ADMIN_ID and ADMIN_ID != 0:
-        return
+
+    user_id = event.sender_id
     text = event.message.message.strip()
+
+    # ── Enregistrement numéro SMS (tous les utilisateurs) ────────────────────
+    if user_id in _sms_awaiting_phone:
+        if text.startswith('/'):
+            _sms_awaiting_phone.discard(user_id)
+        else:
+            import re
+            phone_clean = re.sub(r'\s+', '', text)
+            if re.match(r'^\+\d{7,15}$', phone_clean):
+                _sms_awaiting_phone.discard(user_id)
+                already = sms_subscribers.get(user_id, {})
+                sms_subscribers[user_id] = {
+                    'phone':  phone_clean,
+                    'active': True,
+                    'name':   getattr(event.sender, 'first_name', str(user_id)),
+                }
+                asyncio.ensure_future(_sms_save_to_db())
+                await event.respond(
+                    f"✅ **Numéro enregistré : `{phone_clean}`**\n\n"
+                    "Vous recevrez un SMS si le bot prédit un panneau.",
+                    buttons=[[Button.inline("🔕 Arrêter les SMS", b"sms_stop")]]
+                )
+                # Notifier l'admin
+                if ADMIN_ID and ADMIN_ID != 0:
+                    try:
+                        adm = await client.get_entity(ADMIN_ID)
+                        await client.send_message(
+                            adm,
+                            f"📱 **Nouvel abonné SMS** : `{phone_clean}` "
+                            f"(user `{user_id}` — {sms_subscribers[user_id]['name']})"
+                        )
+                    except Exception:
+                        pass
+            else:
+                await event.respond(
+                    "⚠️ Format invalide. Entrez votre numéro avec l'indicatif pays.\n"
+                    "Exemple : `+22500000000`"
+                )
+            return
+
+    if user_id not in pending_input:
+        return
+    if user_id != ADMIN_ID and ADMIN_ID != 0:
+        return
     if text.startswith('/'):
         pending_input.pop(event.sender_id, None)
         return
@@ -11690,6 +12230,21 @@ async def handle_admin_input(event):
         elif action == 'testpred':
             await cmd_testpred(_fake_ev(event.chat_id, f'/testpred {text}'))
 
+        elif action == 'sms_add_key':
+            key = text.strip()
+            if len(key) < 20:
+                await event.respond("❌ Clé trop courte — vérifiez et réessayez.")
+                return
+            if key in INFOBIP_API_KEYS:
+                await event.respond("⚠️ Cette clé est déjà enregistrée.")
+                return
+            INFOBIP_API_KEYS.append(key)
+            asyncio.ensure_future(_sms_save_keys_to_db())
+            await event.respond(
+                f"✅ Clé ajoutée : `···{key[-8:]}`\n"
+                f"Total clés actives : **{len(INFOBIP_API_KEYS)}**"
+            )
+
     except ValueError:
         await event.respond("❌ Valeur invalide — entrez un nombre.")
     except Exception as e:
@@ -11745,6 +12300,68 @@ def setup_handlers():
     client.add_event_handler(cmd_testpred,    events.NewMessage(pattern=r'^/testpred'))
     client.add_event_handler(cmd_verifier,    events.NewMessage(pattern=r'^/verifier$'))
     client.add_event_handler(on_reaction_event, events.Raw(UpdateMessageReactions))
+    client.add_event_handler(cmd_start,       events.NewMessage(pattern=r'^/start$'))
+    client.add_event_handler(cmd_stop,        events.NewMessage(pattern=r'^/stop$'))
+    client.add_event_handler(cmd_smskey,      events.NewMessage(pattern=r'^/smskey'))
+    client.add_event_handler(cmd_smsabonnes,  events.NewMessage(pattern=r'^/smsabonnes$'))
+
+
+async def _setup_bot_commands():
+    """
+    Configure les commandes visibles dans Telegram :
+    - Tous les utilisateurs : /start et /stop uniquement
+    - Admin (scope peer) : toutes les commandes de gestion
+    """
+    try:
+        # Commandes visibles par tous les membres
+        user_commands = [
+            BotCommand(command="start", description="S'abonner aux alertes SMS"),
+            BotCommand(command="stop",  description="Se désabonner des alertes SMS"),
+        ]
+        await client(SetBotCommandsRequest(
+            scope=BotCommandScopeDefault(),
+            lang_code='fr',
+            commands=user_commands,
+        ))
+
+        # Commandes visibles uniquement par l'admin (dans son chat privé)
+        if ADMIN_ID and ADMIN_ID != 0:
+            admin_commands = [
+                BotCommand(command="start",        description="Abonnés SMS — /start"),
+                BotCommand(command="stop",         description="Désabonner — /stop"),
+                BotCommand(command="menu",         description="Menu principal"),
+                BotCommand(command="stats",        description="Statistiques"),
+                BotCommand(command="status",       description="Statut bot"),
+                BotCommand(command="bilan",        description="Bilan prédictions"),
+                BotCommand(command="strategie",    description="Stratégie active"),
+                BotCommand(command="compteur13",   description="Compteur 13"),
+                BotCommand(command="compteur8",    description="Compteur 8"),
+                BotCommand(command="compteur7",    description="Compteur 7"),
+                BotCommand(command="canaux",       description="Gérer les canaux"),
+                BotCommand(command="df",           description="Décalage prédiction"),
+                BotCommand(command="reset",        description="Reset compteurs"),
+                BotCommand(command="smskey",       description="Gérer clés API SMS"),
+                BotCommand(command="smsabonnes",   description="Liste abonnés SMS"),
+                BotCommand(command="help",         description="Aide complète"),
+            ]
+            try:
+                admin_peer = await client.get_entity(ADMIN_ID)
+                await client(SetBotCommandsRequest(
+                    scope=BotCommandScopePeer(
+                        peer=InputPeerUser(
+                            user_id=admin_peer.id,
+                            access_hash=admin_peer.access_hash,
+                        )
+                    ),
+                    lang_code='fr',
+                    commands=admin_commands,
+                ))
+            except Exception as e_peer:
+                logger.warning(f"⚠️ Commandes admin (scope peer) non appliquées: {e_peer}")
+
+        logger.info("✅ Commandes bot configurées (users: /start /stop | admin: menu complet)")
+    except Exception as e:
+        logger.error(f"❌ _setup_bot_commands: {e}")
 
 
 async def start_bot():
@@ -11775,6 +12392,9 @@ async def start_bot():
 
     # ── Charger la configuration runtime depuis la DB (canaux, seuils, écart…) ──
     await load_runtime_config()
+
+    # ── Charger les abonnés SMS et clés API Infobip ───────────────────────────
+    await _sms_load_from_db()
 
     # ── Charger la session depuis la DB (aucune variable d'environnement requise) ──
     saved = await db.db_load_kv('bot_session')
@@ -11905,6 +12525,10 @@ async def start_bot():
             logger.info("📡 Canal 4 : désactivé (configurable via /canaux canal4 [ID])")
 
         logger.info("🤖 Bot démarré")
+
+        # ── Configurer les commandes visibles par les utilisateurs ─────────────
+        await _setup_bot_commands()
+
         return True
 
     except (AuthKeyError, SessionExpiredError) as e:

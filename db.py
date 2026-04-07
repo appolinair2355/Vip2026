@@ -572,3 +572,66 @@ async def db_reset_all() -> dict:
     except Exception as e:
         logger.error(f"❌ db_reset_all: {e}")
     return counts
+
+
+async def db_reset_cycle() -> dict:
+    """
+    Reset complet de fin de cycle #1440.
+    Vide toutes les tables et tous les kv_store,
+    SAUF les 4 clés critiques :
+      - bot_session      (session Telegram — indispensable)
+      - runtime_config   (configuration admin : canaux, seuils, etc.)
+      - sms_subscribers  (numéros des abonnés SMS)
+      - infobip_api_keys (clés API Infobip)
+    Retourne un dict {table_ou_cle: nb_lignes_supprimées}.
+    """
+    if _pool is None:
+        return {}
+
+    # Clés kv_store à NE PAS effacer
+    PRESERVE_KEYS = {'bot_session', 'runtime_config', 'sms_subscribers', 'infobip_api_keys'}
+
+    counts = {}
+    try:
+        async with _pool.acquire() as conn:
+            # ── Tables entièrement vidées ─────────────────────────────────────
+            for table in ('pending_predictions', 'prediction_history',
+                          'countdown_panels', 'hourly_suit_data', 'game_log'):
+                try:
+                    row = await conn.fetchrow(f"SELECT COUNT(*) AS cnt FROM {table}")
+                    cnt = int(row['cnt']) if row else 0
+                    await conn.execute(f"DELETE FROM {table}")
+                    counts[table] = cnt
+                    logger.info(f"🗑️ Cycle reset: {table} → {cnt} ligne(s) supprimée(s)")
+                except Exception:
+                    pass   # table peut ne pas exister encore
+
+            # ── kv_store : tout sauf les clés préservées ─────────────────────
+            preserved_rows = await conn.fetch(
+                "SELECT key FROM kv_store WHERE key = ANY($1::text[])",
+                list(PRESERVE_KEYS)
+            )
+            preserved = {r['key'] for r in preserved_rows}
+
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM kv_store WHERE key <> ALL($1::text[])",
+                list(PRESERVE_KEYS)
+            )
+            cnt = int(row['cnt']) if row else 0
+            await conn.execute(
+                "DELETE FROM kv_store WHERE key <> ALL($1::text[])",
+                list(PRESERVE_KEYS)
+            )
+            counts['kv_store (hors clés critiques)'] = cnt
+            logger.info(
+                f"🗑️ Cycle reset: kv_store → {cnt} clé(s) supprimée(s) "
+                f"| préservées : {sorted(preserved)}"
+            )
+
+        logger.warning(
+            "🔴 RESET CYCLE #1440 — DB vidée (bot_session, runtime_config, "
+            "sms_subscribers, infobip_api_keys préservés)"
+        )
+    except Exception as e:
+        logger.error(f"❌ db_reset_cycle: {e}")
+    return counts
